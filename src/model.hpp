@@ -11,12 +11,15 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace pk {
 
 class BackendPool;
+class PoolLease;
+class TokenGrammar;
 
 // One text hypothesis returned by the opt-in offline TDT N-best path.
 struct NBestTranscription {
@@ -80,6 +83,22 @@ public:
     std::string transcribe_16k(const std::vector<float>& pcm16k,
                                Decoder decoder = Decoder::kDefault,
                                const std::string& target_lang = "") const;
+
+    // Hard grammar restriction; nullopt means no retained accepting completion.
+    // Default head selection is identical to transcribe_pcm. Beam size 1..64
+    // bounds transducer search; CTC uses best-alignment dynamic programming.
+    std::optional<std::string> transcribe_pcm_grammar(
+        const std::vector<float>& pcm, int sample_rate,
+        std::shared_ptr<const TokenGrammar> grammar,
+        Decoder decoder = Decoder::kDefault, int beam_size = 4,
+        const std::string& target_lang = "") const;
+    std::optional<std::string> transcribe_path_grammar(
+        const std::string& wav_path, std::shared_ptr<const TokenGrammar> grammar,
+        Decoder decoder = Decoder::kDefault, int beam_size = 4,
+        const std::string& target_lang = "") const;
+
+    // Hold across a complete incremental grammar-stream call, not per graph.
+    PoolLease lease_backend() const;
 
     // Resolve a target_lang (locale string) to a prompt index using the model's
     // dictionary. Empty string -> the model's default_lang. Returns -1 and is

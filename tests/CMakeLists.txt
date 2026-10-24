@@ -10,6 +10,18 @@ pk_add_test(test_smoke)
 pk_add_test(test_run_graph_threads)
 pk_add_test(test_nbest_json)
 pk_add_test(test_tdt_beam_core)
+pk_add_test(test_tdt_grammar)
+add_test(NAME test_tdt_grammar_model COMMAND test_tdt_grammar --model)
+set_tests_properties(test_tdt_grammar_model PROPERTIES
+  LABELS "model" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+pk_add_test(test_streaming_grammar)
+add_test(NAME test_streaming_grammar_model COMMAND test_streaming_grammar --model)
+set_tests_properties(test_streaming_grammar_model PROPERTIES
+  LABELS "model" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+pk_add_test(test_rnnt_grammar)
+add_test(NAME test_rnnt_grammar_model COMMAND test_rnnt_grammar --model)
+set_tests_properties(test_rnnt_grammar_model PROPERTIES
+  LABELS "model" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 pk_add_test(test_backend_device)
 pk_add_test(test_backend_pool)
 pk_add_test(test_audio_io)
@@ -42,6 +54,38 @@ pk_add_test(test_encoder_batch_local)
 pk_add_test(test_encoder_eou)
 pk_add_test(test_streaming_encoder)
 pk_add_test(test_ctc)
+pk_add_test(test_grammar)
+pk_add_test(test_ctc_grammar)
+pk_add_test(test_capi_grammar)
+set_tests_properties(test_capi_grammar PROPERTIES LABELS "model" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+add_executable(test_capi_grammar_dispatch test_capi_grammar_dispatch.cpp)
+target_link_libraries(test_capi_grammar_dispatch PRIVATE parakeet)
+target_include_directories(test_capi_grammar_dispatch PRIVATE ${CMAKE_SOURCE_DIR}/src)
+foreach(family hybrid rnnt prompt)
+  add_test(NAME test_capi_grammar_${family} COMMAND test_capi_grammar_dispatch ${family})
+  set_tests_properties(test_capi_grammar_${family} PROPERTIES
+    LABELS "model" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+endforeach()
+pk_add_test(test_capi_grammar_stream)
+add_executable(test_capi_grammar_locale test_capi_grammar_locale.cpp)
+target_link_libraries(test_capi_grammar_locale PRIVATE parakeet)
+target_include_directories(test_capi_grammar_locale PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_capi_grammar_stream_prompt COMMAND test_capi_grammar_stream prompt)
+set_tests_properties(test_capi_grammar_stream test_capi_grammar_stream_prompt PROPERTIES
+  LABELS "model" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+add_executable(test_capi_grammar_c test_capi_grammar_c.c)
+target_link_libraries(test_capi_grammar_c PRIVATE parakeet)
+set_target_properties(test_capi_grammar_c PROPERTIES LINKER_LANGUAGE CXX C_STANDARD 99 C_STANDARD_REQUIRED ON)
+add_test(NAME test_capi_grammar_c COMMAND test_capi_grammar_c)
+set_tests_properties(test_capi_grammar_c PROPERTIES
+  LABELS "model" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+# Static linking would wrap inference-library allocators/locks as well.
+if(PARAKEET_SHARED AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  pk_add_test(test_capi_grammar_faults)
+  target_link_options(test_capi_grammar_faults PRIVATE
+    "-Wl,--wrap=malloc" "-Wl,--wrap=pthread_mutex_lock")
+  set_tests_properties(test_capi_grammar_faults PROPERTIES LABELS "model" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+endif()
 pk_add_test(test_prediction)
 pk_add_test(test_prediction_step)
 pk_add_test(test_prediction_step_batch)
@@ -246,6 +290,11 @@ set_tests_properties(test_pool_stress PROPERTIES ENVIRONMENT "PARAKEET_STRESS_QU
 # Python converter check (skips with exit 77 when the venv/model are absent).
 find_program(PARAKEET_PY NAMES python3 HINTS ${CMAKE_SOURCE_DIR}/.venv/bin)
 if(PARAKEET_PY)
+  add_test(NAME test_capi_grammar_locale COMMAND ${PARAKEET_PY}
+    ${CMAKE_SOURCE_DIR}/tests/python/check_grammar_stream_locale.py
+    $<TARGET_FILE:test_capi_grammar_locale> ${CMAKE_CURRENT_BINARY_DIR}/grammar-locales)
+  set_tests_properties(test_capi_grammar_locale PROPERTIES
+    LABELS "model" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
   add_test(NAME check_convert COMMAND ${PARAKEET_PY} ${CMAKE_SOURCE_DIR}/tests/python/check_convert.py)
   set_tests_properties(check_convert PROPERTIES SKIP_RETURN_CODE 77 LABELS "model")
 

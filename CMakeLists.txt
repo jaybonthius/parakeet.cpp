@@ -133,6 +133,8 @@ set(PARAKEET_SRC
     src/streaming.cpp
     src/buffered_streaming.cpp
     src/ctc_decoder.cpp
+    src/grammar.cpp
+    src/ctc_grammar.cpp
     src/prediction.cpp
     src/joint.cpp
     src/prompt_kernel.cpp
@@ -142,6 +144,7 @@ set(PARAKEET_SRC
     src/ternary_kernels_neon.cpp
     src/tdt.cpp
     src/rnnt.cpp
+    src/rnnt_beam.cpp
     src/transducer_batch.cpp
     src/tokenizer.cpp
     src/search.cpp

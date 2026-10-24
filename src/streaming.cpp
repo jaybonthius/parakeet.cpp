@@ -3,8 +3,28 @@
 #include "mel.hpp"
 #include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+#include <utility>
 
 namespace pk {
+namespace {
+void apply_stream_prompt(const PromptKernel& prompt, int index,
+                         std::vector<float>& enc, int frames, int hidden) {
+    if (prompt.present()) {
+        std::vector<float> chunk_cf((size_t)hidden * frames);  // [d_model, valid]
+        for (int t = 0; t < frames; ++t)
+            for (int c = 0; c < hidden; ++c)
+                chunk_cf[(size_t)c * frames + t] = enc[(size_t)t * hidden + c];
+        std::vector<float> projected;
+        prompt.apply(chunk_cf, hidden, frames, index, projected);  // [d_model, valid]
+        for (int t = 0; t < frames; ++t)
+            for (int c = 0; c < hidden; ++c)
+                enc[(size_t)t * hidden + c] = projected[(size_t)c * frames + t];
+    }
+}
+} // namespace
 
 StreamingSession::StreamingSession(const ModelLoader& ml, const std::string& target_lang)
     : ml_(ml), enc_(ml), pred_(ml), joint_(ml), prompt_(ml) {
@@ -111,17 +131,7 @@ std::vector<int32_t> StreamingSession::feed_mel_chunk(const std::vector<float>& 
     //     time-major [valid, d_model], so transpose in, apply, transpose back.
     //     No-op for non-prompt models (prompt_.present()==false): enc_frames is
     //     left byte-identical.
-    if (prompt_.present()) {
-        std::vector<float> chunk_cf((size_t)d_model_ * n_valid);  // [d_model, valid]
-        for (int t = 0; t < n_valid; ++t)
-            for (int c = 0; c < d_model_; ++c)
-                chunk_cf[(size_t)c * n_valid + t] = enc_frames[(size_t)t * d_model_ + c];
-        std::vector<float> projected;
-        prompt_.apply(chunk_cf, d_model_, n_valid, prompt_index_, projected);  // [d_model, valid]
-        for (int t = 0; t < n_valid; ++t)
-            for (int c = 0; c < d_model_; ++c)
-                enc_frames[(size_t)t * d_model_ + c] = projected[(size_t)c * n_valid + t];
-    }
+    apply_stream_prompt(prompt_, prompt_index_, enc_frames, n_valid, d_model_);
 
     // 2. RNN-T greedy over the new encoder frames, carrying the decoder state
     //    across chunks (do NOT reset). Appends to state_.hyp and returns the ids
@@ -236,6 +246,221 @@ std::vector<EouEvent> StreamingSession::drain_events() {
     std::vector<EouEvent> out;
     out.swap(events_);
     return out;
+}
+
+namespace detail {
+
+NativeMelChunks::NativeMelChunks(int n_mels, int first, int main, int overlap)
+    : n_mels_(n_mels), first_size_(first), main_size_(main), overlap_(overlap) {
+    if (n_mels <= 0 || first <= 0 || main <= 0 || overlap < 0 ||
+        overlap > std::numeric_limits<int>::max() - std::max(first, main))
+        throw std::invalid_argument("invalid native streaming schedule");
+}
+
+void NativeMelChunks::reset() noexcept {
+    total_ = origin_ = next_ = 0;
+    first_ = true;
+    mel_.clear();
+}
+
+void NativeMelChunks::append(const std::vector<float>& frames, int count) {
+    if (n_mels_ <= 0 || count < 0 || frames.size() != (size_t)n_mels_ * count)
+        throw std::invalid_argument("invalid streaming mel frames");
+    if (count == 0) return;
+    if (total_ > std::numeric_limits<int64_t>::max() - count)
+        throw std::runtime_error("streaming mel timeline limit");
+    // Dropping only unreachable history avoids O(stream length) copies and
+    // allocator fragmentation while preserving every native overlap window.
+    const int64_t keep = std::min(total_, std::max(origin_, next_ - overlap_));
+    const size_t old_len = (size_t)(total_ - origin_);
+    const size_t drop = (size_t)(keep - origin_);
+    const size_t kept = old_len - drop;
+    const size_t len = kept + (size_t)count;
+    if (len > std::vector<float>().max_size() / (size_t)n_mels_)
+        throw std::runtime_error("streaming mel buffer limit");
+    std::vector<float> out((size_t)n_mels_ * len);
+    for (int m = 0; m < n_mels_; ++m) {
+        std::copy_n(mel_.begin() + (size_t)m * old_len + drop, kept,
+                    out.begin() + (size_t)m * len);
+        std::copy_n(frames.begin() + (size_t)m * count, count,
+                    out.begin() + (size_t)m * len + kept);
+    }
+    mel_.swap(out);
+    total_ += count;
+    origin_ = keep;
+}
+
+void NativeMelChunks::feed(bool flush,
+        const std::function<void(const std::vector<float>&, int, bool)>& chunk) {
+    if (n_mels_ <= 0) throw std::logic_error("uninitialized streaming schedule");
+    while (next_ < total_) {
+        const int size = first_ ? first_size_ : main_size_;
+        const int64_t hi = next_ + std::min<int64_t>(size, total_ - next_);
+        const bool reaches_end = hi == total_;
+        if (!flush && reaches_end) break;
+        const int64_t lo = first_ ? next_ : std::max<int64_t>(0, next_ - overlap_);
+        const int len = (int)(hi - lo);
+        const size_t local_len = (size_t)(total_ - origin_);
+        std::vector<float> window((size_t)n_mels_ * len);
+        for (int m = 0; m < n_mels_; ++m)
+            std::copy_n(mel_.begin() + (size_t)m * local_len + (size_t)(lo - origin_),
+                        len, window.begin() + (size_t)m * len);
+        chunk(window, len, flush && reaches_end);
+        // On flush a short final chunk consumes exactly the remaining frames.
+        next_ = hi;
+        first_ = false;
+    }
+}
+
+GrammarStreamState::GrammarStreamState(std::shared_ptr<const TokenGrammar> grammar,
+        const std::vector<std::string>& pieces, int blank, int beam_size,
+        int max_symbols, int eou, int eob, double frame_sec)
+    : pieces_(pieces), beam_(std::move(grammar), blank, beam_size, max_symbols,
+                            eou, eob, RnntEndpointPolicy::restart),
+      eob_(eob), frame_sec_(frame_sec) {
+    if (pieces.size() != (size_t)blank || !std::isfinite(frame_sec) || frame_sec <= 0)
+        throw std::invalid_argument("invalid grammar stream vocabulary/timing");
+}
+
+std::string GrammarStreamState::render(const std::vector<RnntBeamToken>& tokens) const {
+    std::vector<int32_t> ids;
+    ids.reserve(tokens.size());
+    for (const auto& token : tokens) ids.push_back(token.id);
+    return detokenize(pieces_, ids);
+}
+
+void GrammarStreamState::commit(const std::vector<RnntAcceptedUnit>& accepted) {
+    for (const auto& unit : accepted) {
+        units_.push_back({render(unit.tokens), unit.endpoint_id, unit.endpoint_id == eob_,
+                          unit.frame, unit.frame * frame_sec_});
+        committed_ = true;
+    }
+}
+
+void GrammarStreamState::end_chunk() {
+    beam_.end_chunk();
+    commit(beam_.commit_units());
+    const auto* best = beam_.best();
+    partial_ = best ? render(best->tokens) : std::string();
+}
+
+bool GrammarStreamState::finalize() {
+    const auto& paths = beam_.hypotheses();
+    const auto accepted = std::find_if(paths.begin(), paths.end(), [&](const auto& hyp) {
+        const bool clean_restart = hyp.tokens.empty() && (committed_ || !hyp.units.empty());
+        return beam_.accepting(hyp) || clean_restart;
+    });
+    if (accepted == paths.end()) return false;
+    // Decoding is terminal: publish endpoints and tail from this same winner,
+    // ranking clean restarts together with DFA-accepting suffixes.
+    commit(accepted->units);
+    if (!accepted->tokens.empty())
+        units_.push_back({render(accepted->tokens), -1, false,
+                          beam_.frame(), beam_.frame() * frame_sec_});
+    partial_.clear();
+    return true;
+}
+
+void GrammarStreamState::reset() {
+    beam_.reset();
+    units_.clear();
+    partial_.clear();
+    committed_ = false;
+}
+
+} // namespace detail
+
+namespace {
+const ModelLoader& validate_grammar_stream(const ModelLoader& ml) {
+    const auto& c = ml.config();
+    if (!c.streaming.present || !c.tdt_durations.empty() || !c.pred_hidden ||
+        !c.pred_rnn_layers || !c.joint_hidden)
+        throw std::invalid_argument("grammar streaming requires a cache-aware RNNT model");
+    if (c.normalize == "per_feature")
+        throw std::invalid_argument("grammar streaming requires frame-local mel normalization");
+    if (!c.causal_downsampling || !c.conv_causal || c.att_context_style != "chunked_limited" ||
+        !c.n_heads || !c.d_model || c.d_model % c.n_heads || !c.hop_length ||
+        !c.sample_rate || !c.subsampling_factor)
+        throw std::invalid_argument("invalid grammar streaming model configuration");
+    return ml;
+}
+int control_id(const ModelLoader& ml, const char* name) {
+    const auto& pieces = ml.config().tokenizer_pieces;
+    const auto found = std::find(pieces.begin(), pieces.end(), name);
+    return found == pieces.end() ? -1 : (int)(found - pieces.begin());
+}
+} // namespace
+
+GrammarStreamingSession::GrammarStreamingSession(const ModelLoader& ml,
+        std::shared_ptr<const TokenGrammar> grammar, int beam_size,
+        const std::string& target_lang)
+    : ml_(validate_grammar_stream(ml)), mel_(ml_), enc_(ml_), pred_(ml_), joint_(ml_),
+      prompt_(ml_), prompt_index_(ml_.config().prompt.present
+          ? ml_.config().prompt.resolve_index_or_throw(target_lang) : -1),
+      chunks_(mel_.n_mels(), enc_.chunk_size_first(), enc_.chunk_size(), enc_.pre_encode_cache_size()),
+      output_(std::move(grammar), ml_.config().tokenizer_pieces, (int)ml_.config().blank_id,
+              beam_size, (int)ml_.config().max_symbols, control_id(ml_, "<EOU>"),
+              control_id(ml_, "<EOB>"), (double)ml_.config().hop_length *
+              ml_.config().subsampling_factor / ml_.config().sample_rate) {
+    if (joint_.num_durations() != 0)
+        throw std::invalid_argument("grammar streaming requires an RNNT joint");
+}
+
+void GrammarStreamingSession::require_active() const {
+    if (!active()) throw std::logic_error("grammar stream requires reset");
+}
+
+void GrammarStreamingSession::feed_chunk(const std::vector<float>& mel, int frames, bool last) {
+    int valid = 0;
+    auto encoded = enc_.step(mel, frames, last, valid);
+    if (valid > 0) {
+        const int hidden = (int)ml_.config().d_model;
+        apply_stream_prompt(prompt_, prompt_index_, encoded, valid, hidden);
+        output_.beam().advance(pred_, joint_, encoded, valid, hidden);
+    }
+    output_.end_chunk();
+}
+
+void GrammarStreamingSession::feed(const float* pcm, int n_samples) {
+    require_active();
+    try {
+        if (n_samples < 0 || (n_samples > 0 && !pcm))
+            throw std::invalid_argument("invalid grammar stream PCM buffer");
+        for (int i = 0; i < n_samples; ++i)
+            if (!std::isfinite(pcm[i])) throw std::invalid_argument("nonfinite grammar stream PCM");
+        if (n_samples > 0) {
+            int count = 0;
+            auto frames = mel_.feed(pcm, n_samples, count);
+            chunks_.append(frames, count);
+        }
+        chunks_.feed(false, [this](const auto& mel, int frames, bool last) {
+            feed_chunk(mel, frames, last);
+        });
+    } catch (...) { fail(); throw; }
+}
+
+bool GrammarStreamingSession::finalize() {
+    require_active();
+    try {
+        int count = 0;
+        auto tail = mel_.finalize(count);
+        chunks_.append(tail, count);
+        chunks_.feed(true, [this](const auto& mel, int frames, bool last) {
+            feed_chunk(mel, frames, last);
+        });
+        const bool matched = output_.finalize();
+        lifecycle_ = Lifecycle::finalized;
+        return matched;
+    } catch (...) { fail(); throw; }
+}
+
+void GrammarStreamingSession::reset() {
+    fail();
+    mel_.reset();
+    enc_.reset();
+    chunks_.reset();
+    output_.reset();
+    lifecycle_ = Lifecycle::active;
 }
 
 void run_stream_over_pcm(

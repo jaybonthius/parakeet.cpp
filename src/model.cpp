@@ -17,6 +17,8 @@
 #include "prompt_kernel.hpp"
 #include "tdt.hpp"
 #include "rnnt.hpp"
+#include "rnnt_beam.hpp"
+#include "ctc_grammar.hpp"
 #include "transducer_batch.hpp"
 #include "transcription.hpp"
 #include "decode_types.hpp"
@@ -128,6 +130,10 @@ std::unique_ptr<Model> Model::load_vad_only(const std::string& gguf_path, const 
 std::shared_ptr<BackendPool> Model::pool_snapshot() const {
     std::lock_guard<std::mutex> lk(pool_mu_);
     return pool_;
+}
+
+PoolLease Model::lease_backend() const {
+    return PoolLease(pool_snapshot());
 }
 
 int Model::set_concurrency(int backends, int threads_each) {
@@ -313,6 +319,93 @@ std::string Model::transcribe_16k(const std::vector<float>& pcm16k,
                           use_tdt ? &decoder_objects().joint : nullptr,
                           encoded.channels_first,
                           encoded.d_model, encoded.frames, use_tdt);
+}
+
+std::optional<std::string> Model::transcribe_pcm_grammar(
+        const std::vector<float>& pcm, int sample_rate,
+        std::shared_ptr<const TokenGrammar> grammar, Decoder decoder, int beam_size,
+        const std::string& target_lang) const {
+    PoolLease lease(pool_snapshot());
+    const auto& cfg = config();
+    if (!grammar || grammar->token_count() != static_cast<int>(cfg.vocab_size) ||
+        cfg.blank_id != cfg.vocab_size)
+        throw std::invalid_argument("grammar: incompatible vocabulary/blank layout");
+    if (sample_rate <= 0 || beam_size < 1 || beam_size > 64 ||
+        (decoder != Decoder::kDefault && decoder != Decoder::kCTC && decoder != Decoder::kTDT))
+        throw std::invalid_argument("grammar: invalid sample rate, decoder or beam size");
+    for (float sample : pcm)
+        if (!std::isfinite(sample)) throw std::invalid_argument("grammar: nonfinite PCM");
+    const bool transducer = decoder == Decoder::kTDT ||
+        (decoder == Decoder::kDefault && arch_prefers_tdt(cfg.arch));
+    if (transducer) {
+        if (!cfg.pred_hidden || !cfg.joint_hidden ||
+            !loader_.tensor("decoder.prediction.embed.weight") ||
+            !loader_.tensor("joint.enc.weight") || !loader_.tensor("joint.pred.weight") ||
+            !loader_.tensor("joint.joint_net.2.weight"))
+            throw std::invalid_argument("grammar: model has no transducer head");
+    } else if ((!loader_.tensor("ctc_decoder.decoder_layers.0.weight") ||
+                !loader_.tensor("ctc_decoder.decoder_layers.0.bias")) &&
+               (!loader_.tensor("decoder.decoder_layers.0.weight") ||
+                !loader_.tensor("decoder.decoder_layers.0.bias"))) {
+        throw std::invalid_argument("grammar: model has no CTC head");
+    }
+    const int prompt_index = resolve_prompt_index(target_lang);
+    const auto pcm16k = sample_rate == 16000 ? pcm : resample_linear(pcm, sample_rate, 16000);
+    if (pcm16k.empty()) {
+        if (grammar->accepting(grammar->start())) return std::string();
+        return std::nullopt;
+    }
+    for (float sample : pcm16k)
+        if (!std::isfinite(sample)) throw std::invalid_argument("grammar: nonfinite resampled PCM");
+    const auto encoded = encode_16k(loader_, pcm16k, prompt_index);
+    std::vector<int32_t> ids;
+    if (!transducer) {
+        CtcGrammar ctc_grammar(grammar, static_cast<int>(cfg.blank_id));
+        CTCDecoder head(loader_);
+        std::vector<float> logits;
+        int classes = 0;
+        head.forward(encoded.channels_first, encoded.d_model, encoded.frames, logits, classes);
+        auto result = ctc_grammar.decode(logits, encoded.frames, classes);
+        if (!result.matched) return std::nullopt;
+        ids = std::move(result.tokens);
+    } else {
+        std::vector<float> rows(static_cast<size_t>(encoded.frames) * encoded.d_model);
+        for (int t = 0; t < encoded.frames; ++t)
+            for (int c = 0; c < encoded.d_model; ++c)
+                rows[static_cast<size_t>(t) * encoded.d_model + c] =
+                    encoded.channels_first[static_cast<size_t>(c) * encoded.frames + t];
+        const auto& objects = decoder_objects();
+        if (!cfg.tdt_durations.empty()) {
+            const auto beam = tdt_beam_search(objects.pred, objects.joint, rows,
+                encoded.frames, encoded.d_model, cfg.tdt_durations,
+                static_cast<int>(cfg.blank_id), beam_size, 1, true, grammar.get());
+            if (beam.empty()) return std::nullopt;
+            for (const auto& token : beam.front().tokens) ids.push_back(token.id);
+        } else {
+            const auto& pieces = loader_.tokenizer_pieces();
+            const auto control = [&](const char* text) {
+                const auto found = std::find(pieces.begin(), pieces.end(), text);
+                return found == pieces.end() ? -1 : static_cast<int>(found - pieces.begin());
+            };
+            RnntGrammarBeam beam(grammar, static_cast<int>(cfg.blank_id), beam_size,
+                static_cast<int>(cfg.max_symbols), control("<EOU>"), control("<EOB>"));
+            beam.advance(objects.pred, objects.joint, rows, encoded.frames, encoded.d_model);
+            const auto* best = beam.best(true);
+            if (!best) return std::nullopt;
+            for (const auto& token : best->tokens) ids.push_back(token.id);
+        }
+    }
+    return detokenize(loader_.tokenizer_pieces(), ids);
+}
+
+std::optional<std::string> Model::transcribe_path_grammar(
+        const std::string& wav_path, std::shared_ptr<const TokenGrammar> grammar,
+        Decoder decoder, int beam_size, const std::string& target_lang) const {
+    Audio audio;
+    if (!load_audio_16k_mono(wav_path, audio))
+        throw std::runtime_error("grammar: cannot load audio file");
+    return transcribe_pcm_grammar(audio.samples, 16000, std::move(grammar),
+                                  decoder, beam_size, target_lang);
 }
 
 void Model::transcribe_16k_ctc_logits(const std::vector<float>& pcm16k,

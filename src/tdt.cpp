@@ -159,7 +159,9 @@ struct BeamState {
     PredState dec_state;
     PredState next_state;
     std::vector<float> pred_out;
-    int last_frame = 0;
+    int64_t last_frame = 0;
+    int grammar_state = 0;
+    int symbols_at_frame = 0;
     int32_t last_token = -1;
     bool emitted_any = false;
     bool pred_valid = false;
@@ -217,18 +219,43 @@ bool same_path(const BeamState& a, const BeamState& b) {
     return true;
 }
 
-void merge_duplicate_hypotheses(std::vector<BeamState>& hypotheses) {
-    std::sort(hypotheses.begin(), hypotheses.end(),
-              [](const BeamState& a, const BeamState& b) {
-                  return a.hyp.score > b.hyp.score;
-              });
+struct SearchBudget {
+    const detail::TdtSearchLimits* limits;
+    size_t work = 0;
+    size_t expansions = 0;
+
+    void charge(size_t amount) {
+        if (limits && (amount > limits->max_work - work))
+            throw std::runtime_error("tdt_beam_search: grammar work limit exceeded");
+        if (limits) work += amount;
+    }
+
+    void expand() {
+        if (limits && ++expansions > limits->max_expansions)
+            throw std::runtime_error("tdt_beam_search: grammar expansion limit exceeded");
+    }
+};
+
+void merge_duplicate_hypotheses(std::vector<BeamState>& hypotheses,
+                                SearchBudget& budget) {
+    const auto better = [](const BeamState& a, const BeamState& b) {
+        return a.hyp.score > b.hyp.score;
+    };
+    if (budget.limits)
+        std::stable_sort(hypotheses.begin(), hypotheses.end(), better);
+    else
+        std::sort(hypotheses.begin(), hypotheses.end(), better);
 
     std::vector<BeamState> merged;
     merged.reserve(hypotheses.size());
     for (BeamState& candidate : hypotheses) {
         auto duplicate = std::find_if(
             merged.begin(), merged.end(),
-            [&](const BeamState& kept) { return same_path(kept, candidate); });
+            [&](const BeamState& kept) {
+                budget.charge(candidate.hyp.tokens.size() + 1);
+                return same_path(kept, candidate) &&
+                    (!budget.limits || kept.symbols_at_frame == candidate.symbols_at_frame);
+            });
         if (duplicate == merged.end()) {
             merged.push_back(std::move(candidate));
         } else {
@@ -244,31 +271,22 @@ float sort_score(const BeamState& hyp, bool score_norm) {
     return hyp.hyp.score / (float)(hyp.hyp.tokens.size() + 1);
 }
 
-} // namespace
-
-std::vector<TdtBeamHypothesis> tdt_beam_search(
-    const PredictionNet& pred, const Joint& joint,
-    const std::vector<float>& enc, int T, int enc_hidden,
-    const std::vector<int32_t>& durations, int blank_id,
-    int beam_size, int nbest, bool score_norm) {
-    if (T < 0 || enc_hidden <= 0 ||
-        enc.size() != (size_t)T * (size_t)enc_hidden)
-        throw std::invalid_argument("tdt_beam_search: invalid encoder shape");
+void validate_search(int T, const std::vector<int32_t>& durations,
+                     int blank_id, int beam_size, int nbest,
+                     const TokenGrammar* grammar) {
     if (durations.empty())
         throw std::invalid_argument("tdt_beam_search: durations must not be empty");
     if (beam_size < 1 || nbest < 1 || nbest > beam_size)
         throw std::invalid_argument(
             "tdt_beam_search: require beam_size >= nbest >= 1");
 
+    if (T < 0 || blank_id < 1)
+        throw std::invalid_argument("tdt_beam_search: invalid search shape");
+    if (grammar && grammar->token_count() != blank_id)
+        throw std::invalid_argument("tdt_beam_search: grammar vocabulary mismatch");
+    if (grammar && beam_size > 64)
+        throw std::invalid_argument("tdt_beam_search: grammar beam exceeds 64");
     const int num_durations = (int)durations.size();
-    const int token_count = joint.V_plus() - num_durations;
-    if (token_count != joint.vocab_size() + 1 ||
-        num_durations != joint.num_durations() ||
-        blank_id != token_count - 1 || blank_id < 1) {
-        throw std::invalid_argument("tdt_beam_search: incompatible TDT head");
-    }
-
-    int zero_duration_idx = -1;
     int zero_duration_count = 0;
     bool has_positive_duration = false;
     for (int i = 0; i < num_durations; ++i) {
@@ -276,7 +294,6 @@ std::vector<TdtBeamHypothesis> tdt_beam_search(
             throw std::invalid_argument(
                 "tdt_beam_search: durations must be non-negative");
         if (durations[i] == 0) {
-            zero_duration_idx = i;
             ++zero_duration_count;
         }
         if (durations[i] > 0)
@@ -288,24 +305,35 @@ std::vector<TdtBeamHypothesis> tdt_beam_search(
     if (zero_duration_count > 1)
         throw std::invalid_argument(
             "tdt_beam_search: at most one zero duration is allowed");
+}
+
+template<class Evaluate>
+std::vector<TdtBeamHypothesis> beam_search(
+    Evaluate&& evaluate, BeamState start, int T,
+    const std::vector<int32_t>& durations, int blank_id,
+    int beam_size, int nbest, bool score_norm, const TokenGrammar* grammar,
+    const detail::TdtSearchLimits& limits = {}) {
     if (T == 0)
-        return {TdtBeamHypothesis{}};
+        return !grammar || grammar->accepting(grammar->start())
+            ? std::vector<TdtBeamHypothesis>{TdtBeamHypothesis{}}
+            : std::vector<TdtBeamHypothesis>{};
+    const int num_durations = (int)durations.size();
+    const auto zero = std::find(durations.begin(), durations.end(), 0);
+    const int zero_duration_idx = zero == durations.end() ? -1 : (int)(zero - durations.begin());
+    SearchBudget budget{grammar ? &limits : nullptr};
 
     const int beam = std::min(beam_size, blank_id);
-    const int token_beam = std::min(beam, blank_id - 1);
+    const int token_beam = std::min(beam, grammar ? blank_id : blank_id - 1);
     const int duration_beam = std::min(beam, num_durations);
 
-    std::vector<float> enc_proj;
-    joint.precompute_enc_proj(enc, T, enc_hidden, enc_proj);
-    const int joint_hidden = joint.joint_hidden();
-
-    BeamState start;
-    start.dec_state = pred.zero_state();
+    start.grammar_state = grammar ? grammar->start() : 0;
     std::vector<BeamState> kept_hyps;
     kept_hyps.push_back(std::move(start));
 
     std::vector<float> logits;
     for (int time_idx = 0; time_idx < T; ++time_idx) {
+        budget.charge(kept_hyps.size() + 1);
+        if (grammar && kept_hyps.empty()) break;
         std::vector<BeamState> current_hyps;
         std::vector<BeamState> future_hyps;
         current_hyps.reserve(kept_hyps.size());
@@ -327,21 +355,15 @@ std::vector<TdtBeamHypothesis> tdt_beam_search(
             BeamState best = std::move(*best_it);
             current_hyps.erase(best_it);
 
-            if (!best.pred_valid) {
-                const bool is_sos = !best.emitted_any;
-                const int32_t label = best.emitted_any ? best.last_token : blank_id;
-                pred.step(label, is_sos, best.dec_state,
-                          best.pred_out, best.next_state);
-                best.pred_valid = true;
-            }
-
-            joint.step_logits(
-                enc_proj.data() + (size_t)time_idx * joint_hidden,
-                best.pred_out.data(), (int)best.pred_out.size(), logits);
+            budget.expand();
+            budget.charge((size_t)blank_id + 1 + durations.size());
+            evaluate(best, time_idx, logits);
+            if (logits.size() != (size_t)blank_id + 1 + durations.size())
+                throw std::runtime_error("tdt_beam_search: invalid logits shape");
             std::vector<float> token_logp =
-                log_softmax(logits.data(), token_count);
+                log_softmax(logits.data(), blank_id + 1);
             std::vector<float> duration_logp =
-                log_softmax(logits.data() + token_count, num_durations);
+                log_softmax(logits.data() + blank_id + 1, num_durations);
             if (!std::all_of(token_logp.begin(), token_logp.end(),
                              [](float value) { return std::isfinite(value); }) ||
                 !std::all_of(duration_logp.begin(), duration_logp.end(),
@@ -359,15 +381,51 @@ std::vector<TdtBeamHypothesis> tdt_beam_search(
                 int duration_idx;
             };
             std::vector<Pair> pairs;
-            const std::vector<RankedIndex> best_tokens =
-                top_k(token_logp.data(), blank_id, token_beam);
-            pairs.reserve(best_tokens.size() * best_durations.size());
-            for (const RankedIndex& duration : best_durations)
-                for (const RankedIndex& token : best_tokens)
-                    pairs.push_back(Pair{
-                        duration.score + token.score,
-                        token.index,
-                        duration.index});
+            const auto add_pairs = [&](const std::vector<RankedIndex>& tokens,
+                                       const std::vector<RankedIndex>& ranked_durations) {
+                budget.charge(tokens.size() * ranked_durations.size() * 16);
+                pairs.reserve(pairs.size() + tokens.size() * ranked_durations.size());
+                for (const RankedIndex& duration : ranked_durations)
+                    for (const RankedIndex& token : tokens) {
+                        const float score = duration.score + token.score;
+                        if (grammar && !std::isfinite(score))
+                            throw std::runtime_error("tdt_beam_search: non-finite pair score");
+                        pairs.push_back(Pair{score, token.index, duration.index});
+                    }
+            };
+            std::vector<RankedIndex> continuing_durations;
+            if (grammar) {
+                const auto trim = [](std::vector<RankedIndex>& ranked, int k) {
+                    const auto better = [](const RankedIndex& a, const RankedIndex& b) {
+                        return a.score != b.score ? a.score > b.score : a.index < b.index;
+                    };
+                    const size_t count = std::min((size_t)k, ranked.size());
+                    std::partial_sort(ranked.begin(), ranked.begin() + count, ranked.end(), better);
+                    ranked.resize(count);
+                };
+                const auto& arcs = grammar->arcs(best.grammar_state);
+                budget.charge(arcs.size() + durations.size());
+                for (int i = 0; i < num_durations; ++i)
+                    if ((int64_t)time_idx + durations[i] < T)
+                        continuing_durations.push_back(RankedIndex{duration_logp[i], i});
+                std::vector<RankedIndex> accepting_tokens, continuing_tokens;
+                for (const auto& arc : arcs) {
+                    if (grammar->accepting(arc.next))
+                        accepting_tokens.push_back(RankedIndex{token_logp[arc.token], arc.token});
+                    else if (!continuing_durations.empty())
+                        continuing_tokens.push_back(RankedIndex{token_logp[arc.token], arc.token});
+                }
+                // Accepting successors allow all durations; unfinished successors
+                // must stay within T. Each class is an eligible Cartesian product,
+                // so marginal top-k cannot hide a better eligible pair.
+                trim(accepting_tokens, token_beam);
+                trim(continuing_tokens, token_beam);
+                trim(continuing_durations, duration_beam);
+                add_pairs(accepting_tokens, best_durations);
+                add_pairs(continuing_tokens, continuing_durations);
+            } else {
+                add_pairs(top_k(token_logp.data(), blank_id, token_beam), best_durations);
+            }
             std::partial_sort(
                 pairs.begin(),
                 pairs.begin() + std::min(token_beam, (int)pairs.size()),
@@ -382,8 +440,14 @@ std::vector<TdtBeamHypothesis> tdt_beam_search(
 
             for (const Pair& pair : pairs) {
                 const int duration = durations[pair.duration_idx];
+                if (grammar && (best.hyp.tokens.size() >= limits.max_tokens ||
+                    best.symbols_at_frame >= limits.max_symbols_per_frame))
+                    throw std::runtime_error("tdt_beam_search: grammar symbol limit exceeded");
+                budget.charge(best.hyp.tokens.size() + 1);
                 BeamState child = best;
                 child.hyp.score += pair.score;
+                if (grammar && !std::isfinite(child.hyp.score))
+                    throw std::runtime_error("tdt_beam_search: non-finite accumulated score");
                 // A near-certain label's log-prob can round to no change in
                 // the running score, so only an increase is an error.
                 if (duration == 0 && child.hyp.score > best.hyp.score) {
@@ -398,28 +462,65 @@ std::vector<TdtBeamHypothesis> tdt_beam_search(
                 child.emitted_any = true;
                 child.pred_valid = false;
                 child.last_frame += duration;
+                if (grammar) {
+                    child.grammar_state = grammar->transition(best.grammar_state, pair.token);
+                    child.symbols_at_frame = duration == 0 ? best.symbols_at_frame + 1 : 0;
+                    if (child.last_frame >= T && !grammar->accepting(child.grammar_state))
+                        continue;
+                }
                 if (duration == 0)
                     current_hyps.push_back(std::move(child));
                 else
                     kept_hyps.push_back(std::move(child));
             }
 
-            for (const RankedIndex& ranked_duration : best_durations) {
+            const bool must_continue = grammar && !grammar->accepting(best.grammar_state);
+            const auto& blank_durations = must_continue ? continuing_durations : best_durations;
+            for (const RankedIndex& ranked_duration : blank_durations) {
                 int duration_idx = ranked_duration.index;
                 if (duration_idx == zero_duration_idx) {
-                    if (best_durations.size() != 1)
+                    if (blank_durations.size() != 1)
                         continue;
-                    duration_idx = detail::best_positive_duration_index(
-                        duration_logp, durations);
+                    if (must_continue) {
+                        duration_idx = -1;
+                        for (int i = 0; i < num_durations; ++i)
+                            if (durations[i] > 0 && (int64_t)time_idx + durations[i] < T &&
+                                (duration_idx < 0 || duration_logp[i] > duration_logp[duration_idx]))
+                                duration_idx = i;
+                        if (duration_idx < 0) continue;
+                    } else {
+                        duration_idx = detail::best_positive_duration_index(
+                            duration_logp, durations);
+                    }
                 }
+                budget.charge(best.hyp.tokens.size() + 1);
                 BeamState child = best;
                 child.hyp.score += token_logp[blank_id] +
                                    duration_logp[duration_idx];
+                if (grammar && !std::isfinite(child.hyp.score))
+                    throw std::runtime_error("tdt_beam_search: non-finite accumulated score");
                 child.last_frame += durations[duration_idx];
+                if (grammar) {
+                    child.symbols_at_frame = 0;
+                    if (child.last_frame >= T && !grammar->accepting(child.grammar_state))
+                        continue;
+                }
                 kept_hyps.push_back(std::move(child));
             }
 
-            merge_duplicate_hypotheses(kept_hyps);
+            if (grammar) {
+                if (current_hyps.size() + kept_hyps.size() > limits.max_hypotheses)
+                    throw std::runtime_error("tdt_beam_search: grammar hypothesis limit exceeded");
+                budget.charge(current_hyps.size() + kept_hyps.size());
+                size_t live_tokens = 0;
+                for (const auto* hyps : {&current_hyps, &kept_hyps})
+                    for (const auto& hyp : *hyps) {
+                        if (hyp.hyp.tokens.size() > limits.max_live_tokens - live_tokens)
+                            throw std::runtime_error("tdt_beam_search: grammar history limit exceeded");
+                        live_tokens += hyp.hyp.tokens.size();
+                    }
+            }
+            merge_duplicate_hypotheses(kept_hyps, budget);
             if (!current_hyps.empty()) {
                 const float next_score = std::max_element(
                     current_hyps.begin(), current_hyps.end(),
@@ -441,20 +542,26 @@ std::vector<TdtBeamHypothesis> tdt_beam_search(
                     break;
                 }
             } else {
-                std::sort(kept_hyps.begin(), kept_hyps.end(),
-                          [](const BeamState& a, const BeamState& b) {
-                              return a.hyp.score > b.hyp.score;
-                          });
+                const auto better = [](const BeamState& a, const BeamState& b) {
+                    return a.hyp.score > b.hyp.score;
+                };
+                if (grammar)
+                    std::stable_sort(kept_hyps.begin(), kept_hyps.end(), better);
+                else
+                    std::sort(kept_hyps.begin(), kept_hyps.end(), better);
                 if ((int)kept_hyps.size() > beam)
                     kept_hyps.resize(beam);
             }
         }
     }
 
-    std::sort(kept_hyps.begin(), kept_hyps.end(),
-              [score_norm](const BeamState& a, const BeamState& b) {
-                  return sort_score(a, score_norm) > sort_score(b, score_norm);
-              });
+    const auto better = [score_norm](const BeamState& a, const BeamState& b) {
+        return sort_score(a, score_norm) > sort_score(b, score_norm);
+    };
+    if (grammar)
+        std::stable_sort(kept_hyps.begin(), kept_hyps.end(), better);
+    else
+        std::sort(kept_hyps.begin(), kept_hyps.end(), better);
     const int count = std::min(nbest, (int)kept_hyps.size());
     std::vector<TdtBeamHypothesis> result;
     result.reserve(count);
@@ -466,5 +573,77 @@ std::vector<TdtBeamHypothesis> tdt_beam_search(
     }
     return result;
 }
+
+} // namespace
+
+std::vector<TdtBeamHypothesis> tdt_beam_search(
+    const PredictionNet& pred, const Joint& joint,
+    const std::vector<float>& enc, int T, int enc_hidden,
+    const std::vector<int32_t>& durations, int blank_id,
+    int beam_size, int nbest, bool score_norm) {
+    return tdt_beam_search(pred, joint, enc, T, enc_hidden, durations,
+                           blank_id, beam_size, nbest, score_norm, nullptr);
+}
+
+std::vector<TdtBeamHypothesis> tdt_beam_search(
+    const PredictionNet& pred, const Joint& joint,
+    const std::vector<float>& enc, int T, int enc_hidden,
+    const std::vector<int32_t>& durations, int blank_id,
+    int beam_size, int nbest, bool score_norm, const TokenGrammar* grammar) {
+    if (T < 0 || enc_hidden <= 0 ||
+        enc.size() != (size_t)T * (size_t)enc_hidden)
+        throw std::invalid_argument("tdt_beam_search: invalid encoder shape");
+    const int num_durations = (int)durations.size();
+    const int token_count = joint.V_plus() - num_durations;
+    if (token_count != joint.vocab_size() + 1 ||
+        num_durations != joint.num_durations() ||
+        blank_id != token_count - 1 || blank_id < 1) {
+        throw std::invalid_argument("tdt_beam_search: incompatible TDT head");
+    }
+
+    validate_search(T, durations, blank_id, beam_size, nbest, grammar);
+    std::vector<float> enc_proj;
+    if (T > 0) joint.precompute_enc_proj(enc, T, enc_hidden, enc_proj);
+    const int joint_hidden = joint.joint_hidden();
+    BeamState start;
+    if (T > 0) start.dec_state = pred.zero_state();
+    const auto evaluate = [&](BeamState& best, int frame, std::vector<float>& logits) {
+        if (!best.pred_valid) {
+            const bool is_sos = !best.emitted_any;
+            const int32_t label = best.emitted_any ? best.last_token : blank_id;
+            pred.step(label, is_sos, best.dec_state, best.pred_out, best.next_state);
+            best.pred_valid = true;
+        }
+        joint.step_logits(enc_proj.data() + (size_t)frame * joint_hidden,
+                          best.pred_out.data(), (int)best.pred_out.size(), logits);
+    };
+    return beam_search(evaluate, std::move(start), T, durations, blank_id,
+                       beam_size, nbest, score_norm, grammar);
+}
+
+namespace detail {
+
+std::vector<TdtBeamHypothesis> tdt_beam_search_scored(
+    const std::vector<TdtScoredTransition>& transitions, int T,
+    const std::vector<int32_t>& durations, int blank_id,
+    int beam_size, int nbest, bool score_norm, const TokenGrammar& grammar,
+    const TdtSearchLimits& limits) {
+    validate_search(T, durations, blank_id, beam_size, nbest, &grammar);
+    const auto evaluate = [&](BeamState& best, int frame, std::vector<float>& logits) {
+        std::vector<int32_t> prefix;
+        for (const auto& token : best.hyp.tokens) prefix.push_back(token.id);
+        const auto row = std::find_if(transitions.begin(), transitions.end(),
+            [&](const TdtScoredTransition& row) {
+                return row.frame == frame && row.prefix == prefix;
+            });
+        if (row == transitions.end())
+            throw std::invalid_argument("tdt_beam_search_scored: missing transition");
+        logits = row->logits;
+    };
+    return beam_search(evaluate, BeamState{}, T, durations, blank_id,
+                       beam_size, nbest, score_norm, &grammar, limits);
+}
+
+} // namespace detail
 
 } // namespace pk

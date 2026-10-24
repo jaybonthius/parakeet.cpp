@@ -446,6 +446,93 @@ int parakeet_capi_transcribe_pcm_logits(parakeet_ctx* ctx, const float* samples,
 // parakeet_capi_transcribe_pcm_logits. Safe on NULL.
 void parakeet_capi_free_logits(float* logits);
 
+// Readable regular-text grammars (not full GBNF/CFG), offline and streaming.
+// Rules use `root ::= expression`, one rule per line. Expressions support UTF-8
+// quoted literals, [character-ranges], [^negated-classes], concatenation, |,
+// groups and ? * +. Groups may span lines; # starts a comment outside literals
+// and classes. Escapes: \" \\ \n \r \t \xHH \uHHHH \UHHHHHHHH (Unicode scalars).
+// Named references must be acyclic. Recursion, {m,n} and wildcard . are errors.
+// Case, punctuation and whitespace match exactly, after the normal tokenizer's
+// replacement of U+2581 with space and removal of one initial space. All
+// compatible subword segmentations are considered. Control/empty pieces are
+// excluded; vocabularies with invalid UTF-8 pieces/byte fallback are unsupported.
+// Offline supports CTC, TDT and RNNT, including hybrid default selection and
+// language prompts. Streaming requires native cache-aware RNNT with frame-local
+// mel. No grammar integration into N-best, timestamps/confidence, VAD, batch,
+// SAS/scene or CLI. Compilation/search safety limits can fail valid requests.
+//
+// create copies/compiles the rules, returning NULL on failure. Grammar API
+// diagnostics are best-effort: allocation/locking failures while recording an
+// error may leave ctx last_error unchanged. No exception crosses the C boundary.
+// The immutable handle is bound to ctx; ctx must outlive all handles, streams
+// and calls. Cross-context use is rejected. Concurrent calls/streams may share
+// a handle; do not free it during a call. Streams retain its compiled grammar
+// after grammar_free. One caller at a time per stream.
+// No callbacks or borrowed rule buffers are retained. free(NULL) is safe.
+typedef struct parakeet_grammar parakeet_grammar;
+parakeet_grammar* parakeet_capi_grammar_create(parakeet_ctx* ctx, const char* rules);
+void parakeet_capi_grammar_free(parakeet_grammar* grammar);
+
+enum {
+    PARAKEET_GRAMMAR_OK = 0,
+    PARAKEET_GRAMMAR_NO_MATCH = 1,
+    PARAKEET_GRAMMAR_ERROR = 2
+};
+// decoder: 0=architecture default (transducer for hybrids), 1=CTC, 2=TDT/RNNT.
+// Missing selected heads and unknown selectors are errors, never fallbacks.
+// beam_size: 1..64 (ignored by CTC). CTC maximizes the original alignment log
+// score. TDT uses bounded length-normalized beam search; RNNT uses a bounded
+// Viterbi alignment beam, not summed prefix probabilities. All retain original
+// model probabilities. Only a complete accepted output succeeds; NO_MATCH means
+// no retained accepting completion, NOT acoustic rejection or calibrated confidence.
+// Grammar spans the whole offline request. Empty accepted text is an allocated
+// empty string. target_lang: NULL/"" = model default, as in *_lang.
+// With a valid out_text, always initializes *out_text to NULL; OK returns a
+// malloc'd string (free_string); NO_MATCH/ERROR return no string. ERROR attempts
+// to set ctx last_error; OK/NO_MATCH clear it. NULL samples requires zero length.
+// All grammar boundaries contain exceptions; diagnostics are best-effort.
+int parakeet_capi_transcribe_pcm_grammar(
+    parakeet_ctx* ctx, const parakeet_grammar* grammar,
+    const float* samples, int n_samples, int sample_rate,
+    int decoder, int beam_size, const char* target_lang, char** out_text);
+int parakeet_capi_transcribe_path_grammar(
+    parakeet_ctx* ctx, const parakeet_grammar* grammar, const char* wav_path,
+    int decoder, int beam_size, const char* target_lang, char** out_text);
+
+// Real incremental 16 kHz mono f32 PCM, not buffered offline transcription.
+// Begin returns NULL on unsupported model/configuration, bad beam/language or
+// mismatched context. Partial text is revisable and NEVER append-only. Each JSON
+// document contains the current partial plus ONLY newly committed units/events:
+// {"partial":"...","units":[{"text":"...","endpoint_id":1024,"frame":98,"t":7.84}],
+//  "events":[{"type":"eou","id":1024,"frame":98,"t":7.84}]}
+// EOU and EOB both require grammar acceptance and restart the grammar per unit.
+// EOB is a backchannel, not end-of-turn. Units are immutable native-chunk-final
+// beam commitments; incompatible histories are pruned, compatible suffixes kept.
+// This endpoint commitment and the finite beam are approximations, not globally
+// exact recognition. Final tail units have endpoint_id=-1 and no event; their
+// frame/time is end-of-input, not a fabricated EOU. Times are absolute seconds
+// from the stream origin; frames are 64-bit encoder positions.
+// Feed returns OK while active. Finalize flushes actual tail audio, returns OK
+// for a complete suffix/clean restart or NO_MATCH for an incomplete remainder,
+// preserving prior units. Both are terminal. OK/NO_MATCH own malloc'd JSON
+// (free_string); ERROR always leaves *out_json NULL. Units/events are consumed
+// only after successful output allocation. Any ERROR requires reset, never PCM
+// replay; terminal/error streams refuse feed/finalize until reset. Reset clears
+// ALL buffers, caches, search, queued output and time; returns OK or ERROR.
+// NULL samples is valid for zero length. free(NULL) is safe. Context outlives
+// stream, but the grammar handle can be freed immediately after successful begin.
+// See docs/capi.md for offline and streaming C usage.
+typedef struct parakeet_grammar_stream parakeet_grammar_stream;
+parakeet_grammar_stream* parakeet_capi_grammar_stream_begin(
+    parakeet_ctx* ctx, const parakeet_grammar* grammar, int beam_size,
+    const char* target_lang);
+int parakeet_capi_grammar_stream_feed_json(parakeet_grammar_stream* stream,
+    const float* samples, int n_samples, char** out_json);
+int parakeet_capi_grammar_stream_finalize_json(parakeet_grammar_stream* stream,
+    char** out_json);
+int parakeet_capi_grammar_stream_reset(parakeet_grammar_stream* stream);
+void parakeet_capi_grammar_stream_free(parakeet_grammar_stream* stream);
+
 // ---------------------------------------------------------------------------
 // Streaming API (cache-aware streaming RNN-T, e.g. the EOU model
 // nvidia/parakeet_realtime_eou_120m-v1). The stream session buffers incoming

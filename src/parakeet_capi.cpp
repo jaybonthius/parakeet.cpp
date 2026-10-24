@@ -1,5 +1,7 @@
 #include "parakeet_capi.h"
 #include "parakeet.h"     // pk::Decoder
+#include "grammar.hpp"
+#include "backend_pool.hpp"
 #include "model.hpp"      // pk::Model
 #include "diarization.hpp" // pk::DiarizationModel
 #include "diarization_streaming.hpp" // pk::StreamingDiarization
@@ -34,10 +36,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <iomanip>
+#include <locale>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <new>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -113,6 +119,23 @@ struct parakeet_ctx {
     ErrorSlot last_error;
 };
 
+struct parakeet_grammar {
+    const parakeet_ctx* owner;
+    std::shared_ptr<const pk::TokenGrammar> compiled;
+    parakeet_grammar(const parakeet_ctx* ctx, const std::string& rules)
+        : owner(ctx), compiled(std::make_shared<const pk::TokenGrammar>(
+              rules, ctx->model->loader().tokenizer_pieces())) {}
+};
+
+struct parakeet_grammar_stream {
+    parakeet_ctx* ctx;
+    pk::GrammarStreamingSession session;
+    parakeet_grammar_stream(parakeet_ctx* owner,
+            std::shared_ptr<const pk::TokenGrammar> grammar, int beam_size,
+            const std::string& lang)
+        : ctx(owner), session(owner->model->loader(), std::move(grammar), beam_size, lang) {}
+};
+
 // Enrolled voices plus a buffer for the last save/load error.
 struct parakeet_speaker_registry {
     pk::SpeakerRegistry reg;
@@ -143,19 +166,8 @@ struct parakeet_speaker_registry {
 struct parakeet_stream {
     parakeet_ctx* ctx = nullptr;             // borrowed (must outlive the stream)
     std::unique_ptr<pk::StreamingMel> mel;   // incremental log-mel front end
-    // mel_buf holds ONLY the still-reachable window of mel history, feat-major
-    // [n_mels, mel_T - mel_buf_origin]; column 0 is ABSOLUTE frame mel_buf_origin
-    // (see append_mel_frames / feed_available's window()). Frames strictly
-    // before mel_buffer_idx - pre_encode_cache_size() can never be read again
-    // (mel_buffer_idx only advances -- see feed_available), so they are dropped
-    // as they age out instead of being retained for the life of the stream.
-    std::vector<float> mel_buf;
-    int n_mels = 0;
-    int mel_T = 0;                           // total mel frames accumulated so far (absolute)
-    int mel_buf_origin = 0;                  // absolute frame index of mel_buf's column 0
+    pk::detail::NativeMelChunks chunks;
     std::unique_ptr<pk::StreamingSession> sess;
-    int mel_buffer_idx = 0;                  // next un-fed mel frame (chunk schedule)
-    bool first_chunk = true;                 // chunk 0 has no pre-encode overlap
     bool finalized = false;
     // Buffered streams (unified checkpoints, ABI v11): when set, the cache-aware
     // members above stay unused and every stream_* call takes this path.
@@ -163,61 +175,8 @@ struct parakeet_stream {
 };
 
 namespace {
-// Append `n_new` feat-major mel frames `[n_mels, n_new]` to the stream's
-// accumulated feat-major mel buffer, growing mel_T, and drop the prefix that
-// feed_available's window() can provably never read again.
-//
-// ROOT CAUSE of mudler/parakeet.cpp#63 (the streaming RSS leak): the mel buffer
-// used to retain the FULL stream history from mel_buffer_idx==0 forever, so
-// this function rebuilt a `[n_mels, T]` array from scratch on EVERY stream_feed
-// call with T monotonically growing for the life of the stream -- not just O(T)
-// CPU per call (the reason this rebuild exists at all, per the original
-// comment), but a continuous sequence of UNIQUELY, EVER-LARGER-sized heap
-// allocations. A general-purpose allocator can never satisfy a strictly-larger
-// request from a smaller freed block, so the freed (now too-small) blocks from
-// every earlier call accumulate as unusable, unreturned pages instead of being
-// recycled -- the process's live working set stays tiny (a few MB) but the
-// CUMULATIVE allocator debt grows with the stream's length, which is exactly
-// why the upstream report finds it reclaimed by neither stream_free nor a
-// fresh stream_begin: it is allocator-level fragmentation from the discarded
-// buffers' sizes, not stream-owned memory.
-//
-// feed_available's window(lo, hi) only ever reads lo >= mel_buffer_idx -
-// pre_cache, and mel_buffer_idx is monotonically non-decreasing (it only moves
-// forward by chunk_size). So at the START of any call here (mel_buffer_idx
-// unchanged since the previous feed_available pass), every mel frame before
-// mel_buffer_idx - pre_cache is provably dead and safe to drop; mel_buf then
-// stays bounded to O(pre_cache + chunk_size) -- a small constant -- instead of
-// O(stream length), for the life of the stream.
 void append_mel_frames(parakeet_stream* s, const std::vector<float>& frames, int n_new) {
-    if (n_new <= 0) return;
-    const int n_mels = s->n_mels;
-    const int old_T = s->mel_T;                 // absolute frame count so far
-    const int new_T = old_T + n_new;
-
-    const int pre_cache = s->sess ? s->sess->pre_encode_cache_size() : 0;
-    int keep_from = s->mel_buffer_idx - pre_cache;
-    if (keep_from < s->mel_buf_origin) keep_from = s->mel_buf_origin;  // never move backward
-    if (keep_from > old_T) keep_from = old_T;                          // never past what exists
-
-    const int old_local_T = old_T - s->mel_buf_origin;   // mel_buf's current column count
-    const int drop_local   = keep_from - s->mel_buf_origin;  // columns to drop from the front
-    const int kept         = old_local_T - drop_local;       // columns carried forward
-    const int new_local_T  = kept + n_new;
-
-    std::vector<float> out((size_t)n_mels * new_local_T);
-    for (int m = 0; m < n_mels; ++m) {
-        // carry forward the still-reachable tail [drop_local, old_local_T)
-        for (int t = 0; t < kept; ++t)
-            out[(size_t)m * new_local_T + t] =
-                s->mel_buf[(size_t)m * old_local_T + (drop_local + t)];
-        // append the newly-arrived frames
-        for (int t = 0; t < n_new; ++t)
-            out[(size_t)m * new_local_T + (kept + t)] = frames[(size_t)m * n_new + t];
-    }
-    s->mel_buf.swap(out);
-    s->mel_T = new_T;
-    s->mel_buf_origin = keep_from;
+    s->chunks.append(frames, n_new);
 }
 } // namespace
 
@@ -556,6 +515,225 @@ extern "C" int parakeet_capi_transcribe_pcm_logits(parakeet_ctx* ctx,
 
 extern "C" void parakeet_capi_free_logits(float* logits) {
     std::free(logits);
+}
+
+namespace {
+void record_grammar_error(parakeet_ctx* ctx, const char* message) noexcept {
+    // Diagnostics must not let a secondary allocation/locking failure escape to C.
+    try { if (ctx) ctx->last_error = message; } catch (...) {}
+}
+
+void require_grammar_model(const parakeet_ctx* ctx) {
+    if (!ctx->model) throw std::runtime_error("grammar: context is not an ASR model");
+    const auto& loader = ctx->model->loader();
+    const auto& cfg = ctx->model->config();
+    if (cfg.vocab_size > 65536 || cfg.blank_id != cfg.vocab_size ||
+        cfg.vocab_size != loader.tokenizer_pieces().size())
+        throw std::runtime_error("grammar: unsupported vocabulary/blank layout");
+}
+
+void require_bound_grammar(const parakeet_ctx* ctx, const parakeet_grammar* grammar) {
+    require_grammar_model(ctx);
+    if (!grammar || grammar->owner != ctx)
+        throw std::invalid_argument("grammar: handle belongs to a different context or is NULL");
+}
+
+pk::Decoder grammar_decoder(int decoder) {
+    if (decoder < 0 || decoder > 2) throw std::invalid_argument("grammar: invalid decoder");
+    return to_decoder(decoder);
+}
+
+int publish_grammar_text(parakeet_ctx* ctx, const std::optional<std::string>& text,
+                         char** out_text) {
+    ctx->last_error.clear();
+    if (!text) return PARAKEET_GRAMMAR_NO_MATCH;
+    char* buffer = dup_to_c(*text);
+    if (!buffer) throw std::bad_alloc();
+    *out_text = buffer;
+    return PARAKEET_GRAMMAR_OK;
+}
+
+std::string grammar_stream_json(const pk::GrammarStreamingSession& session) {
+    std::string out = "{\"partial\":";
+    pk::append_json_string(out, session.partial());
+    out += ",\"units\":[";
+    const auto& units = session.units();
+    auto position = [&](const pk::GrammarStreamUnit& unit) {
+        out += ",\"frame\":" + std::to_string(unit.encoder_frame) + ",\"t\":";
+        std::ostringstream time;
+        // Formatting failures must reach the boundary before acknowledgement.
+        time.exceptions(std::ios::badbit | std::ios::failbit);
+        time.imbue(std::locale::classic());
+        time << std::fixed << std::setprecision(6) << unit.time_sec;
+        out += time.str();
+    };
+    for (size_t i = 0; i < units.size(); ++i) {
+        if (i) out += ',';
+        const auto& unit = units[i];
+        out += "{\"text\":";
+        pk::append_json_string(out, unit.text);
+        out += ",\"endpoint_id\":" + std::to_string(unit.endpoint_id);
+        position(unit);
+        out += '}';
+    }
+    out += "],\"events\":[";
+    bool first = true;
+    for (const auto& unit : units) {
+        if (unit.endpoint_id < 0) continue;
+        if (!first) out += ',';
+        first = false;
+        out += unit.is_eob ? "{\"type\":\"eob\",\"id\":" : "{\"type\":\"eou\",\"id\":";
+        out += std::to_string(unit.endpoint_id);
+        position(unit);
+        out += '}';
+    }
+    return out + "]}";
+}
+
+int grammar_stream_call(parakeet_grammar_stream* stream, const float* samples,
+                        int n_samples, bool finalize, char** out_json) {
+    if (out_json) *out_json = nullptr;
+    if (!stream) return PARAKEET_GRAMMAR_ERROR;
+    try {
+        if (!out_json) throw std::invalid_argument("grammar stream: NULL output pointer");
+        auto lease = stream->ctx->model->lease_backend();
+        bool matched = true;
+        if (finalize) matched = stream->session.finalize();
+        else stream->session.feed(samples, n_samples);
+        const auto json = grammar_stream_json(stream->session);
+        stream->ctx->last_error.clear();
+        char* buffer = dup_to_c(json);
+        if (!buffer) throw std::bad_alloc();
+        // No throwing work after allocation: publish units/events atomically.
+        stream->session.acknowledge_output();
+        *out_json = buffer;
+        return matched ? PARAKEET_GRAMMAR_OK : PARAKEET_GRAMMAR_NO_MATCH;
+    } catch (const std::exception& e) {
+        record_grammar_error(stream->ctx, e.what());
+    } catch (...) {
+        record_grammar_error(stream->ctx, "grammar stream: unknown error");
+    }
+    stream->session.fail();
+    return PARAKEET_GRAMMAR_ERROR;
+}
+}
+
+extern "C" parakeet_grammar* parakeet_capi_grammar_create(parakeet_ctx* ctx, const char* rules) {
+    if (!ctx) return nullptr;
+    try {
+        require_grammar_model(ctx);
+        if (!rules) throw std::runtime_error("grammar: NULL rules");
+        // Bound the input before constructing a string from an FFI buffer.
+        size_t length = 0;
+        while (length <= pk::TokenGrammar::kMaxRuleBytes && rules[length]) ++length;
+        if (length > pk::TokenGrammar::kMaxRuleBytes) throw std::runtime_error("grammar: source limit exceeded");
+        auto grammar = std::make_unique<parakeet_grammar>(ctx, std::string(rules, length));
+        ctx->last_error.clear();
+        return grammar.release();
+    } catch (const std::exception& e) {
+        record_grammar_error(ctx, e.what());
+    } catch (...) {
+        record_grammar_error(ctx, "grammar: unknown error");
+    }
+    return nullptr;
+}
+
+extern "C" void parakeet_capi_grammar_free(parakeet_grammar* grammar) {
+    delete grammar;
+}
+
+extern "C" int parakeet_capi_transcribe_pcm_grammar(
+    parakeet_ctx* ctx, const parakeet_grammar* grammar,
+    const float* samples, int n_samples, int sample_rate,
+    int decoder, int beam_size, const char* target_lang, char** out_text) {
+    if (out_text) *out_text = nullptr;
+    if (!ctx) return PARAKEET_GRAMMAR_ERROR;
+    try {
+        if (!out_text) throw std::invalid_argument("grammar: NULL output pointer");
+        require_bound_grammar(ctx, grammar);
+        if (n_samples < 0 || (!samples && n_samples))
+            throw std::invalid_argument("grammar: invalid PCM buffer");
+        std::vector<float> pcm;
+        if (n_samples) pcm.assign(samples, samples + n_samples);
+        const auto result = ctx->model->transcribe_pcm_grammar(pcm, sample_rate,
+            grammar->compiled, grammar_decoder(decoder), beam_size, target_lang ? target_lang : "");
+        return publish_grammar_text(ctx, result, out_text);
+    } catch (const std::exception& e) {
+        record_grammar_error(ctx, e.what());
+    } catch (...) {
+        record_grammar_error(ctx, "grammar: unknown error");
+    }
+    return PARAKEET_GRAMMAR_ERROR;
+}
+
+extern "C" int parakeet_capi_transcribe_path_grammar(
+    parakeet_ctx* ctx, const parakeet_grammar* grammar, const char* wav_path,
+    int decoder, int beam_size, const char* target_lang, char** out_text) {
+    if (out_text) *out_text = nullptr;
+    if (!ctx) return PARAKEET_GRAMMAR_ERROR;
+    try {
+        if (!out_text || !wav_path) throw std::invalid_argument("grammar: NULL path or output pointer");
+        require_bound_grammar(ctx, grammar);
+        const auto result = ctx->model->transcribe_path_grammar(wav_path, grammar->compiled,
+            grammar_decoder(decoder), beam_size, target_lang ? target_lang : "");
+        return publish_grammar_text(ctx, result, out_text);
+    } catch (const std::exception& e) {
+        record_grammar_error(ctx, e.what());
+    } catch (...) {
+        record_grammar_error(ctx, "grammar: unknown error");
+    }
+    return PARAKEET_GRAMMAR_ERROR;
+}
+
+extern "C" parakeet_grammar_stream* parakeet_capi_grammar_stream_begin(
+    parakeet_ctx* ctx, const parakeet_grammar* grammar, int beam_size,
+    const char* target_lang) {
+    if (!ctx) return nullptr;
+    try {
+        require_bound_grammar(ctx, grammar);
+        if (ctx->model->config().sample_rate != 16000)
+            throw std::invalid_argument("grammar stream: model must use 16 kHz PCM");
+        auto lease = ctx->model->lease_backend();
+        auto stream = std::make_unique<parakeet_grammar_stream>(ctx, grammar->compiled,
+            beam_size, target_lang ? target_lang : "");
+        ctx->last_error.clear();
+        return stream.release();
+    } catch (const std::exception& e) {
+        record_grammar_error(ctx, e.what());
+    } catch (...) {
+        record_grammar_error(ctx, "grammar stream: unknown error");
+    }
+    return nullptr;
+}
+
+extern "C" int parakeet_capi_grammar_stream_feed_json(parakeet_grammar_stream* stream,
+    const float* samples, int n_samples, char** out_json) {
+    return grammar_stream_call(stream, samples, n_samples, false, out_json);
+}
+
+extern "C" int parakeet_capi_grammar_stream_finalize_json(parakeet_grammar_stream* stream,
+    char** out_json) {
+    return grammar_stream_call(stream, nullptr, 0, true, out_json);
+}
+
+extern "C" int parakeet_capi_grammar_stream_reset(parakeet_grammar_stream* stream) {
+    if (!stream) return PARAKEET_GRAMMAR_ERROR;
+    try {
+        auto lease = stream->ctx->model->lease_backend();
+        stream->session.reset();
+        stream->ctx->last_error.clear();
+        return PARAKEET_GRAMMAR_OK;
+    } catch (const std::exception& e) {
+        record_grammar_error(stream->ctx, e.what());
+    } catch (...) {
+        record_grammar_error(stream->ctx, "grammar stream: unknown error");
+    }
+    stream->session.fail();
+    return PARAKEET_GRAMMAR_ERROR;
+}
+
+extern "C" void parakeet_capi_grammar_stream_free(parakeet_grammar_stream* stream) {
+    delete stream;
 }
 
 extern "C" int parakeet_capi_transcribe_pcm_batch_lang(parakeet_ctx* ctx,
@@ -1103,73 +1281,19 @@ extern "C" char* parakeet_capi_transcribe_pcm_nbest_json(
 
 namespace {
 
-// Feed any not-yet-fed encoder chunks for which enough mel frames are now
-// buffered, carrying the StreamingSession caches. Operates over the stream's
-// INCREMENTALLY-accumulated mel buffer (s->mel_buf / s->mel_T) — the mel for
-// new PCM is produced frame-local by StreamingMel in the feed/finalize entry
-// points, NOT recomputed over the whole buffer here. `flush` marks the final
-// partial chunk is_last (keep_all_outputs), draining the remaining frames. Sets
-// eou_flag / eob_flag to 1 if an <EOU> / <EOB> (respectively) fired in this
-// pass — attributed by watermarking the session's un-drained event queue, so
-// the queue itself is left intact for the caller to drain. Returns the newly-
-// finalized text.
+// Native windowing is shared with grammar streams; legacy text/event ownership
+// remains here so the append-only greedy output contract is unchanged.
 std::string feed_available(parakeet_stream* s, bool flush, int& eou_flag,
                            int& eob_flag) {
     eou_flag = 0;
     eob_flag = 0;
     pk::StreamingSession& sess = *s->sess;
     const size_t ev0 = sess.events().size();
-
-    const int n_mels = s->n_mels;
-    const int T = s->mel_T;              // absolute total frame count
-    if (T <= 0) return std::string();
-    const int origin = s->mel_buf_origin;   // absolute index of mel_buf's column 0
-    const int local_T = T - origin;         // mel_buf's actual (bounded) column count
-    const std::vector<float>& mel = s->mel_buf;  // [n_mels, local_T] feat-major, columns [origin, T)
-
-    const int chunk0     = sess.chunk_size_first();
-    const int chunk_main = sess.chunk_size();
-    const int pre_cache  = sess.pre_encode_cache_size();
-
-    // lo/hi are ABSOLUTE frame indices (as before); translate into mel_buf's
-    // own local (origin-relative) columns. append_mel_frames guarantees
-    // lo >= mel_buffer_idx - pre_cache is always still resident.
-    auto window = [&](int lo, int hi) {
-        const int len = hi - lo;
-        std::vector<float> w((size_t)n_mels * len);
-        for (int m = 0; m < n_mels; ++m)
-            for (int t = 0; t < len; ++t)
-                w[(size_t)m * len + t] = mel[(size_t)m * local_T + (lo - origin + t)];
-        return w;
-    };
-
     std::string new_text;
-    while (s->mel_buffer_idx < T) {
-        const int chunk_size = s->first_chunk ? chunk0 : chunk_main;
-        const int chunk_hi   = std::min(s->mel_buffer_idx + chunk_size, T);
-        if (chunk_hi - s->mel_buffer_idx <= 0) break;
-        const bool reaches_end = (chunk_hi >= T);
-        // Mid-stream (not flushing): only feed a chunk if there is STRICTLY more
-        // audio after it (chunk_hi < T) so it is definitely not the final chunk
-        // (kept at valid_out_len). The chunk that reaches the end of the current
-        // buffer is deferred to flush, where it is fed with keep_all_outputs
-        // (is_last) so the streaming tail frames are retained — matching NeMo's
-        // CacheAwareStreamingAudioBuffer last-chunk behaviour and the validated
-        // run_stream_over_pcm / test_streaming_decode schedule.
-        if (!flush && reaches_end) break;
-        const int lo = s->first_chunk ? s->mel_buffer_idx
-                                      : std::max(0, s->mel_buffer_idx - pre_cache);
-        std::vector<float> win = window(lo, chunk_hi);
-        const int win_frames = chunk_hi - lo;
-        const bool is_last = flush && reaches_end;
-
-        sess.feed_mel_chunk(win, win_frames, is_last);
+    s->chunks.feed(flush, [&](const auto& window, int frames, bool last) {
+        sess.feed_mel_chunk(window, frames, last);
         new_text += sess.take_new_text();
-
-        s->mel_buffer_idx += chunk_size;  // shift_size == chunk_size here
-        s->first_chunk = false;
-        if (is_last) break;               // flushed the end-of-stream tail
-    }
+    });
     for (size_t i = ev0; i < sess.events().size(); ++i)
         (sess.events()[i].is_eob ? eob_flag : eou_flag) = 1;
     return new_text;
@@ -1292,7 +1416,9 @@ extern "C" parakeet_stream* parakeet_capi_stream_begin_opts(parakeet_ctx* ctx,
         s->ctx = ctx;
         s->sess = std::make_unique<pk::StreamingSession>(ctx->model->loader(), lang);
         s->mel  = std::make_unique<pk::StreamingMel>(ctx->model->loader());
-        s->n_mels = s->mel->n_mels();
+        s->chunks = pk::detail::NativeMelChunks(s->mel->n_mels(),
+            s->sess->chunk_size_first(), s->sess->chunk_size(),
+            s->sess->pre_encode_cache_size());
         ctx->last_error.clear();
         return s.release();
     } catch (const std::exception& e) {
@@ -1366,11 +1492,7 @@ extern "C" int parakeet_capi_stream_reset(parakeet_stream* s) {
             if (!s->sess || !s->mel) { s->ctx->last_error = "stream is not initialised"; return -1; }
             s->sess->reset();
             s->mel->reset();
-            s->mel_buf.clear();
-            s->mel_T = 0;
-            s->mel_buf_origin = 0;
-            s->mel_buffer_idx = 0;
-            s->first_chunk = true;
+            s->chunks.reset();
             s->finalized = false;
         }
         s->ctx->last_error.clear();

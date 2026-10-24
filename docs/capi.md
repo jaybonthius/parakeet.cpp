@@ -76,3 +76,91 @@ The text does not depend on the feed size: the same audio fed in blocks of 1, 16
 **CPU speed.** On a laptop-class CPU only the default 1.12 s preset keeps up with real time. The shorter presets fall behind, because each step re-encodes the whole `left + chunk + right` window, so the cost per step does not shrink with the chunk. Measure the GPU before relying on a shorter preset there.
 
 The LocalAI backend (in the LocalAI repo) dlopens `libparakeet.so` and uses these symbols directly: the offline `parakeet_capi_transcribe_*` / `parakeet_capi_transcribe_path_json` and the streaming `parakeet_capi_stream_*`. See `include/parakeet_capi.h` for the full API. The C++ streaming session (`pk::StreamingSession`) also exposes per-word timestamps and confidence as words finalize, via `drain_words()` alongside the EOU events, which the CLI `--stream --timestamps` path prints.
+
+## Readable grammar constraints
+
+The additive `parakeet_capi_*_grammar` and `parakeet_capi_grammar_stream_*`
+functions restrict decoding, not post-filtering. Legacy functions remain
+unconstrained. Offline PCM/path calls select `decoder=0` (architecture default,
+**transducer for hybrids**), `1` (CTC), or `2` (TDT/RNNT). A missing head is an
+error, never a CTC fallback. `beam_size` is 1..64, ignored by CTC. Language
+prompts use the same `target_lang` convention as `*_lang`.
+
+```c
+parakeet_grammar *g = parakeet_capi_grammar_create(ctx,
+    "root ::= action \" \" room\n"
+    "action ::= \"open\" | \"close\"\n"
+    "room ::= \"kitchen\" | \"office\"");
+if (!g) { /* inspect parakeet_capi_last_error(ctx) */ return 1; }
+char *text = NULL;
+int status = parakeet_capi_transcribe_path_grammar(
+    ctx, g, "command.wav", 0, 4, NULL, &text);
+if (status == PARAKEET_GRAMMAR_OK) printf("%s\n", text);
+parakeet_capi_free_string(text); /* NO_MATCH/ERROR leave text NULL */
+parakeet_capi_grammar_free(g);
+```
+
+This is a **regular subset**, not recursive GBNF/CFG: UTF-8 quoted literals,
+character ranges/negated classes, concatenation, alternatives, groups, `? * +`,
+acyclic named rules, and `#` comments. Unsupported syntax (including recursion,
+`{m,n}`, wildcard `.`), invalid UTF-8/byte-fallback vocabulary pieces and resource
+limit exhaustion fail explicitly. Case, punctuation and whitespace match
+exactly after U+2581 becomes space and exactly one initial space is removed per
+unit. Compatible subword segmentations remain legal; control tokens are not
+text. The header lists escapes and ownership details.
+
+CTC chooses a best original frame alignment, not transcript posterior. TDT uses
+a bounded length-normalized beam; RNNT uses a bounded Viterbi alignment beam,
+not summed-prefix probabilities. Illegal text is excluded before pruning without
+renormalizing model probabilities. Finite beams/symbol limits can discard valid
+completions. `NO_MATCH` means no retained accepting completion, **not acoustic
+rejection**; a narrow grammar can force unrelated speech into an accepted phrase.
+No calibrated confidence or general accuracy claim follows from acceptance.
+
+### Real grammar streaming
+
+Use a native cache-aware RNNT model with frame-local mel (e.g. realtime EOU or
+the prompt-conditioned Nemotron streaming model), not an offline TDT/hybrid.
+`begin` refuses unsupported models/configurations. Feed 16 kHz mono f32 PCM in
+arbitrary fragment sizes; frontend, encoder schedule and caches are incremental.
+
+```c
+parakeet_grammar_stream *s = parakeet_capi_grammar_stream_begin(ctx, g, 4, "en");
+if (!s) { /* inspect ctx last_error; g still belongs to caller */ return 1; }
+parakeet_capi_grammar_free(g); /* s retains the compiled grammar */
+char *json = NULL;
+int status = parakeet_capi_grammar_stream_feed_json(s, pcm, n_samples, &json);
+/* Consume json only on OK/NO_MATCH; ERROR leaves it NULL. */
+parakeet_capi_free_string(json);
+/* ...feed more audio while OK... */
+status = parakeet_capi_grammar_stream_finalize_json(s, &json);
+parakeet_capi_free_string(json);
+parakeet_capi_grammar_stream_free(s);
+```
+
+Each successful document has `partial` (replace the displayed provisional
+suffix), `units` (append only these newly committed accepted text units) and
+`events` (new real `eou`/`eob` markers). Do **not** append `partial` to a transcript.
+Units contain `text`, `endpoint_id`, absolute 64-bit encoder `frame` and seconds
+`t`; events contain `type`, token `id`, `frame`, `t`. EOB is a backchannel, not
+end-of-turn. Endpoints require acceptance and restart the grammar immediately;
+all later native frames still run, preserving the next provisional suffix.
+Predictor reset happens at native-chunk end, matching legacy timing. Selected
+chunk-final units are irreversible bounded-beam commitments; incompatible
+histories are pruned, not globally optimized against future audio.
+
+Finalize flushes the actual tail without inventing EOU. An accepted tail has
+`endpoint_id=-1`, end-of-input position and no event. An incomplete remainder
+returns `NO_MATCH` with JSON, preserving prior units and the incomplete partial.
+Finalize is terminal for both OK and NO_MATCH. Any ERROR is terminal too: reset
+before further feed/finalize, never replay PCM on an errored stream. Reset clears
+all buffers, caches, search, output queues and time to a fresh origin. Output
+queues are acknowledged only after successful JSON allocation.
+
+Contexts outlive all handles/streams/calls. Handles are context-bound and
+shareable across concurrent requests/streams; one caller at a time per stream.
+Freeing a handle after begin is safe. Diagnostics are best-effort even on
+allocation/locking failure; no grammar boundary lets exceptions cross C.
+Grammar wiring into N-best, legacy timestamps/confidence, VAD/batch/SAS/scene
+and CLI is intentionally absent. Real EOB audio and GPU grammar behavior have
+not been validated; EOB endpoint semantics have synthetic coverage.

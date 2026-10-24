@@ -2,6 +2,7 @@
 #include "prediction.hpp"
 #include "joint.hpp"
 #include "decode_types.hpp"
+#include "grammar.hpp"
 #include <vector>
 #include <cstdint>
 
@@ -89,9 +90,13 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
 //   * duplicate (token sequence, last frame) paths are merged with logaddexp;
 //   * final hypotheses are sorted by normalized score by default.
 //
-// A zero-duration expansion must strictly reduce the accumulated log score.
-// Rejecting non-finite or non-decreasing scores prevents a malformed model from
-// creating a non-progress loop without truncating valid hypotheses.
+// With a grammar, illegal labels are excluded before candidate pruning, using
+// the original full-slice probabilities. Only accepting completions are returned
+// (empty means no retained match). The bounded beam is approximate, not acoustic
+// rejection. Symbol, live-history and work limits throw on resource exhaustion;
+// they never advance time artificially. Blank leaves the text state unchanged.
+// Grammar calls require beam_size <= 64 and a matching text vocabulary (blank
+// ID == grammar.token_count()). The caller keeps the grammar alive for the call.
 //
 // This is an opt-in offline decoder. The existing tdt_greedy path is not used
 // or modified. `beam_size` and `nbest` must be positive, with nbest <=
@@ -101,8 +106,35 @@ std::vector<TdtBeamHypothesis> tdt_beam_search(
     const std::vector<float>& enc, int T, int enc_hidden,
     const std::vector<int32_t>& durations, int blank_id,
     int beam_size, int nbest, bool score_norm = true);
+std::vector<TdtBeamHypothesis> tdt_beam_search(
+    const PredictionNet& pred, const Joint& joint,
+    const std::vector<float>& enc, int T, int enc_hidden,
+    const std::vector<int32_t>& durations, int blank_id,
+    int beam_size, int nbest, bool score_norm, const TokenGrammar* grammar);
 
 namespace detail {
+
+struct TdtSearchLimits {
+    size_t max_expansions = 1000000;
+    size_t max_work = 100000000;
+    size_t max_live_tokens = 1048576;
+    size_t max_hypotheses = 8192;
+    size_t max_tokens = 65536;
+    int max_symbols_per_frame = 128;
+};
+
+// Internal test seam: raw joint logits for (frame, complete emitted ID history).
+// It exercises the production search without a model or a configurable scorer.
+struct TdtScoredTransition {
+    int frame;
+    std::vector<int32_t> prefix;
+    std::vector<float> logits;
+};
+std::vector<TdtBeamHypothesis> tdt_beam_search_scored(
+    const std::vector<TdtScoredTransition>& transitions, int T,
+    const std::vector<int32_t>& durations, int blank_id,
+    int beam_size, int nbest, bool score_norm, const TokenGrammar& grammar,
+    const TdtSearchLimits& limits = {});
 
 // Returns the index of the highest-scoring positive duration, or -1 when no
 // positive duration exists. Kept in the internal TDT header so the beam-size-1

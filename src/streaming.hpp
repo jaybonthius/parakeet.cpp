@@ -4,6 +4,8 @@
 #include "prediction.hpp"
 #include "joint.hpp"
 #include "rnnt.hpp"
+#include "rnnt_beam.hpp"
+#include "mel.hpp"
 #include "prompt_kernel.hpp"
 #include "decode_types.hpp"
 #include "transcription.hpp"
@@ -177,6 +179,99 @@ private:
     // the last (still-open) word — flush_all=true (finalize) makes every word
     // final, including the trailing one.
     void regroup_words(bool flush_all);
+};
+
+namespace detail {
+
+// Shared incremental native window schedule. Retain only reachable overlap;
+// defer the last available chunk until more audio arrives or flush is requested.
+class NativeMelChunks {
+public:
+    NativeMelChunks() = default;
+    NativeMelChunks(int n_mels, int first, int main, int overlap);
+    void reset() noexcept;
+    void append(const std::vector<float>& frames, int count);
+    void feed(bool flush,
+              const std::function<void(const std::vector<float>&, int, bool)>& chunk);
+private:
+    int n_mels_ = 0, first_size_ = 0, main_size_ = 0, overlap_ = 0;
+    int64_t total_ = 0, origin_ = 0, next_ = 0;
+    bool first_ = true;
+    std::vector<float> mel_;
+};
+
+} // namespace detail
+
+struct GrammarStreamUnit {
+    std::string text;
+    int endpoint_id = -1;           // -1: accepted final tail, not an event
+    bool is_eob = false;
+    int64_t encoder_frame = 0;      // event frame, or end-of-input frame count for a tail
+    double time_sec = 0;
+};
+
+namespace detail {
+// Output/commit state shared by real inference and scored-transition tests.
+class GrammarStreamState {
+public:
+    GrammarStreamState(std::shared_ptr<const TokenGrammar> grammar,
+                      const std::vector<std::string>& pieces, int blank,
+                      int beam_size, int max_symbols, int eou, int eob, double frame_sec);
+    void end_chunk();
+    bool finalize();
+    void reset();
+    const std::string& partial() const { return partial_; }
+    const std::vector<GrammarStreamUnit>& units() const { return units_; }
+    void acknowledge() noexcept { units_.clear(); }
+    RnntGrammarBeam& beam() { return beam_; }
+    const RnntGrammarBeam& beam() const { return beam_; }
+private:
+    std::string render(const std::vector<RnntBeamToken>& tokens) const;
+    void commit(const std::vector<RnntAcceptedUnit>& accepted);
+    const std::vector<std::string>& pieces_;
+    RnntGrammarBeam beam_;
+    int eob_;
+    double frame_sec_;
+    bool committed_ = false;
+    std::string partial_;
+    std::vector<GrammarStreamUnit> units_;
+};
+} // namespace detail
+
+// Separate from legacy append-only text: partial() is revisable, units() are
+// immutable accepted units. Endpoints commit the chunk-final bounded-beam
+// winner, not a globally exact recognition. One caller; loader/context outlives it.
+class GrammarStreamingSession {
+public:
+    GrammarStreamingSession(const ModelLoader& ml,
+                            std::shared_ptr<const TokenGrammar> grammar,
+                            int beam_size = 4, const std::string& target_lang = "");
+    void feed(const float* pcm, int n_samples);
+    // Flush actual buffered audio. False means an incomplete remainder, without
+    // retracting earlier units. Both results are terminal until reset().
+    bool finalize();
+    void reset();
+    const std::string& partial() const { return output_.partial(); }
+    const std::vector<GrammarStreamUnit>& units() const { return output_.units(); }
+    // Call ONLY after successfully allocating/publishing the output document.
+    void acknowledge_output() noexcept { output_.acknowledge(); }
+    void fail() noexcept { lifecycle_ = Lifecycle::error; }
+    bool active() const { return lifecycle_ == Lifecycle::active; }
+    int64_t encoder_frame() const { return output_.beam().frame(); }
+private:
+    enum class Lifecycle { active, finalized, error };
+    void require_active() const;
+    void feed_chunk(const std::vector<float>& mel, int frames, bool last);
+    const ModelLoader& ml_;
+    StreamingMel mel_;
+    StreamingEncoder enc_;
+    PredictionNet pred_;
+    Joint joint_;
+    PromptKernel prompt_;
+    int prompt_index_;
+    detail::NativeMelChunks chunks_;
+    detail::GrammarStreamState output_;
+    Lifecycle lifecycle_ = Lifecycle::active;
 };
 
 // Drive a StreamingSession over a whole 16 kHz mono PCM clip in the model's
