@@ -51,7 +51,8 @@ CtcGrammar::CtcGrammar(std::shared_ptr<const TokenGrammar> grammar, int blank_id
     }
 }
 
-CtcGrammar::Result CtcGrammar::decode(const std::vector<float>& log_probs, int frames, int classes) const {
+CtcGrammar::Result CtcGrammar::decode(const std::vector<float>& log_probs, int frames, int classes,
+                                      bool alternatives) const {
     if (frames < 0 || classes != classes_ ||
         static_cast<size_t>(frames) > std::numeric_limits<size_t>::max() / static_cast<size_t>(classes) ||
         log_probs.size() != static_cast<size_t>(frames) * classes) fail("invalid log-probability dimensions");
@@ -88,16 +89,30 @@ CtcGrammar::Result CtcGrammar::decode(const std::vector<float>& log_probs, int f
         }
     Result result;
     if (best < 0) return result;
+    const auto traceback = [&](int state) {
+        std::vector<int> alignment(static_cast<size_t>(frames));
+        for (int t = frames; t > 0; --t) {
+            alignment[t - 1] = ctc_states_[state].previous;
+            state = trace[static_cast<size_t>(t) * count + state];
+        }
+        std::vector<int32_t> tokens;
+        int previous = blank_;
+        for (int token : alignment) {
+            if (token != blank_ && token != previous) tokens.push_back(token);
+            previous = token;
+        }
+        return tokens;
+    };
     result.matched = true; result.score = score;
-    std::vector<int> alignment(static_cast<size_t>(frames));
-    for (int t = frames; t > 0; --t) {
-        alignment[t - 1] = ctc_states_[best].previous;
-        best = trace[static_cast<size_t>(t) * count + best];
-    }
-    int previous = blank_;
-    for (int token : alignment) {
-        if (token != blank_ && token != previous) result.tokens.push_back(token);
-        previous = token;
+    result.tokens = traceback(best);
+    if (alternatives) {
+        std::vector<int> ends;
+        for (size_t i = 0; i < count; ++i)
+            if (static_cast<int>(i) != best && current[i] != impossible &&
+                grammar_->accepting(ctc_states_[i].grammar)) ends.push_back(static_cast<int>(i));
+        std::stable_sort(ends.begin(), ends.end(),
+                         [&](int a, int b) { return current[a] > current[b]; });
+        for (int end : ends) result.alternatives.push_back({traceback(end), current[end]});
     }
     return result;
 }

@@ -331,6 +331,21 @@ TokenGrammar::TokenGrammar(const std::string& rules, const std::vector<std::stri
     }
 }
 
+std::shared_ptr<const TokenGrammar> TokenGrammar::unconstrained(
+        int token_count, const std::vector<int>& controls) {
+    if (token_count <= 0 || static_cast<size_t>(token_count) > kMaxPieces)
+        fail("unsupported vocabulary size");
+    std::shared_ptr<TokenGrammar> grammar(new TokenGrammar());
+    grammar->tokens_ = token_count;
+    grammar->states_.emplace_back();
+    auto& state = grammar->states_.back();
+    state.accepting = true;
+    for (int token = 0; token < token_count; ++token)
+        if (std::find(controls.begin(), controls.end(), token) == controls.end())
+            state.edges.push_back({token, 0});
+    return grammar;
+}
+
 int TokenGrammar::transition(int state, int token) const {
     const auto& edges = arcs(state);
     auto it = std::lower_bound(edges.begin(), edges.end(), token,

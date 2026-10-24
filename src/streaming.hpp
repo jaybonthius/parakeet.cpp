@@ -208,6 +208,9 @@ struct GrammarStreamUnit {
     bool is_eob = false;
     int64_t encoder_frame = 0;      // event frame, or end-of-input frame count for a tail
     double time_sec = 0;
+    // Span: from the previous publication (or reset) to the end of the native
+    // chunk that published this unit; units published together share it.
+    GrammarScores scores;
 };
 
 namespace detail {
@@ -225,14 +228,22 @@ public:
     void acknowledge() noexcept { units_.clear(); }
     RnntGrammarBeam& beam() { return beam_; }
     const RnntGrammarBeam& beam() const { return beam_; }
+    // Unconstrained search for free_score; advance it over the same frames.
+    RnntGrammarBeam& free_beam() { return free_; }
 private:
     std::string render(const std::vector<RnntBeamToken>& tokens) const;
-    void commit(const std::vector<RnntAcceptedUnit>& accepted);
+    void publish(const RnntBeamHypothesis& winner, bool tail);
+    std::vector<GrammarAlternative> alternatives(const RnntBeamHypothesis& winner,
+                                                 size_t index, const std::string& text) const;
     const std::vector<std::string>& pieces_;
     RnntGrammarBeam beam_;
+    RnntGrammarBeam free_;
     int eob_;
     double frame_sec_;
     bool committed_ = false;
+    // Cumulative scores and frame at the previous publication.
+    double published_score_ = 0, published_free_score_ = 0;
+    int64_t published_frame_ = 0;
     std::string partial_;
     std::vector<GrammarStreamUnit> units_;
 };

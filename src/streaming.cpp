@@ -317,6 +317,8 @@ GrammarStreamState::GrammarStreamState(std::shared_ptr<const TokenGrammar> gramm
         int max_symbols, int eou, int eob, double frame_sec)
     : pieces_(pieces), beam_(std::move(grammar), blank, beam_size, max_symbols,
                             eou, eob, RnntEndpointPolicy::restart),
+      free_(TokenGrammar::unconstrained(blank, {eou, eob}), blank, beam_size, max_symbols,
+            eou, eob, RnntEndpointPolicy::restart),
       eob_(eob), frame_sec_(frame_sec) {
     if (pieces.size() != (size_t)blank || !std::isfinite(frame_sec) || frame_sec <= 0)
         throw std::invalid_argument("invalid grammar stream vocabulary/timing");
@@ -329,17 +331,66 @@ std::string GrammarStreamState::render(const std::vector<RnntBeamToken>& tokens)
     return detokenize(pieces_, ids);
 }
 
-void GrammarStreamState::commit(const std::vector<RnntAcceptedUnit>& accepted) {
-    for (const auto& unit : accepted) {
-        units_.push_back({render(unit.tokens), unit.endpoint_id, unit.endpoint_id == eob_,
-                          unit.frame, unit.frame * frame_sec_});
-        committed_ = true;
+std::vector<GrammarAlternative> GrammarStreamState::alternatives(
+        const RnntBeamHypothesis& winner, size_t index, const std::string& text) const {
+    // Other retained paths that agree on the earlier units published with this
+    // one: their unit `index`, or their unfinished text if the grammar accepts it.
+    std::vector<GrammarAlternative> found;
+    for (const auto& hyp : beam_.hypotheses()) {
+        if (&hyp == &winner || hyp.units.size() < index) continue;
+        bool compatible = true;
+        for (size_t i = 0; i < index && compatible; ++i)
+            compatible = same_unit(hyp.units[i], winner.units[i]);
+        if (!compatible) continue;
+        std::string candidate;
+        if (hyp.units.size() > index) candidate = render(hyp.units[index].tokens);
+        else if (!hyp.tokens.empty() && beam_.accepting(hyp)) candidate = render(hyp.tokens);
+        else continue;
+        if (candidate == text || std::any_of(found.begin(), found.end(),
+                [&](const auto& seen) { return seen.text == candidate; })) continue;
+        found.push_back({std::move(candidate), hyp.score - published_score_});
     }
+    std::stable_sort(found.begin(), found.end(),
+                     [](const auto& a, const auto& b) { return a.score > b.score; });
+    return found;
+}
+
+void GrammarStreamState::publish(const RnntBeamHypothesis& winner, bool tail) {
+    const size_t count = winner.units.size() + (tail && !winner.tokens.empty() ? 1 : 0);
+    if (!count) return;
+    const auto* free_best = free_.best();
+    const double free_total = free_best ? free_best->score : 0;
+    GrammarScores span;
+    span.score = winner.score - published_score_;
+    span.free_score = free_total - published_free_score_;
+    span.frames = beam_.frame() - published_frame_;
+    for (size_t i = 0; i < count; ++i) {
+        GrammarStreamUnit unit;
+        if (i < winner.units.size()) {
+            const auto& accepted = winner.units[i];
+            unit = {render(accepted.tokens), accepted.endpoint_id, accepted.endpoint_id == eob_,
+                    accepted.frame, accepted.frame * frame_sec_};
+            committed_ = true;
+        } else {
+            unit = {render(winner.tokens), -1, false, beam_.frame(), beam_.frame() * frame_sec_};
+        }
+        unit.scores = span;
+        unit.scores.alternatives = alternatives(winner, i, unit.text);
+        units_.push_back(std::move(unit));
+    }
+    published_score_ = winner.score;
+    published_free_score_ = free_total;
+    published_frame_ = beam_.frame();
 }
 
 void GrammarStreamState::end_chunk() {
     beam_.end_chunk();
-    commit(beam_.commit_units());
+    free_.end_chunk();
+    free_.commit_units(); // retire unconstrained history the same way
+    // commit_units() selects this same best() path, then prunes the beam.
+    const auto* winner = beam_.best();
+    if (winner && !winner->units.empty()) publish(*winner, false);
+    beam_.commit_units();
     const auto* best = beam_.best();
     partial_ = best ? render(best->tokens) : std::string();
 }
@@ -353,16 +404,16 @@ bool GrammarStreamState::finalize() {
     if (accepted == paths.end()) return false;
     // Decoding is terminal: publish endpoints and tail from this same winner,
     // ranking clean restarts together with DFA-accepting suffixes.
-    commit(accepted->units);
-    if (!accepted->tokens.empty())
-        units_.push_back({render(accepted->tokens), -1, false,
-                          beam_.frame(), beam_.frame() * frame_sec_});
+    publish(*accepted, true);
     partial_.clear();
     return true;
 }
 
 void GrammarStreamState::reset() {
     beam_.reset();
+    free_.reset();
+    published_score_ = published_free_score_ = 0;
+    published_frame_ = 0;
     units_.clear();
     partial_.clear();
     committed_ = false;
@@ -417,6 +468,7 @@ void GrammarStreamingSession::feed_chunk(const std::vector<float>& mel, int fram
         const int hidden = (int)ml_.config().d_model;
         apply_stream_prompt(prompt_, prompt_index_, encoded, valid, hidden);
         output_.beam().advance(pred_, joint_, encoded, valid, hidden);
+        output_.free_beam().advance(pred_, joint_, encoded, valid, hidden);
     }
     output_.end_chunk();
 }

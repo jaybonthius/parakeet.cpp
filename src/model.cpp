@@ -321,10 +321,27 @@ std::string Model::transcribe_16k(const std::vector<float>& pcm16k,
                           encoded.d_model, encoded.frames, use_tdt);
 }
 
-std::optional<std::string> Model::transcribe_pcm_grammar(
+namespace {
+// Distinct texts other than the winner, best score per text, best first.
+std::vector<GrammarAlternative> distinct_alternatives(
+        std::vector<GrammarAlternative> candidates, const std::string& winner, size_t limit) {
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const auto& a, const auto& b) { return a.score > b.score; });
+    std::vector<GrammarAlternative> out;
+    for (auto& candidate : candidates) {
+        if (out.size() == limit) break;
+        if (candidate.text == winner || std::any_of(out.begin(), out.end(),
+                [&](const auto& seen) { return seen.text == candidate.text; })) continue;
+        out.push_back(std::move(candidate));
+    }
+    return out;
+}
+} // namespace
+
+std::optional<GrammarTranscription> Model::decode_grammar(
         const std::vector<float>& pcm, int sample_rate,
         std::shared_ptr<const TokenGrammar> grammar, Decoder decoder, int beam_size,
-        const std::string& target_lang) const {
+        const std::string& target_lang, bool scored) const {
     PoolLease lease(pool_snapshot());
     const auto& cfg = config();
     if (!grammar || grammar->token_count() != static_cast<int>(cfg.vocab_size) ||
@@ -352,12 +369,16 @@ std::optional<std::string> Model::transcribe_pcm_grammar(
     const int prompt_index = resolve_prompt_index(target_lang);
     const auto pcm16k = sample_rate == 16000 ? pcm : resample_linear(pcm, sample_rate, 16000);
     if (pcm16k.empty()) {
-        if (grammar->accepting(grammar->start())) return std::string();
+        if (grammar->accepting(grammar->start())) return GrammarTranscription{};
         return std::nullopt;
     }
     for (float sample : pcm16k)
         if (!std::isfinite(sample)) throw std::invalid_argument("grammar: nonfinite resampled PCM");
     const auto encoded = encode_16k(loader_, pcm16k, prompt_index);
+    const auto& pieces = loader_.tokenizer_pieces();
+    GrammarTranscription out;
+    out.scores.frames = encoded.frames;
+    std::vector<GrammarAlternative> candidates;
     std::vector<int32_t> ids;
     if (!transducer) {
         CtcGrammar ctc_grammar(grammar, static_cast<int>(cfg.blank_id));
@@ -365,9 +386,19 @@ std::optional<std::string> Model::transcribe_pcm_grammar(
         std::vector<float> logits;
         int classes = 0;
         head.forward(encoded.channels_first, encoded.d_model, encoded.frames, logits, classes);
-        auto result = ctc_grammar.decode(logits, encoded.frames, classes);
+        auto result = ctc_grammar.decode(logits, encoded.frames, classes, scored);
         if (!result.matched) return std::nullopt;
         ids = std::move(result.tokens);
+        if (scored) {
+            out.scores.score = result.score;
+            // The best unconstrained CTC alignment takes each frame's best label.
+            for (int t = 0; t < encoded.frames; ++t) {
+                const auto row = logits.begin() + static_cast<size_t>(t) * classes;
+                out.scores.free_score += *std::max_element(row, row + classes);
+            }
+            for (const auto& path : result.alternatives)
+                candidates.push_back({detokenize(pieces, path.tokens), path.score});
+        }
     } else {
         std::vector<float> rows(static_cast<size_t>(encoded.frames) * encoded.d_model);
         for (int t = 0; t < encoded.frames; ++t)
@@ -376,26 +407,76 @@ std::optional<std::string> Model::transcribe_pcm_grammar(
                     encoded.channels_first[static_cast<size_t>(c) * encoded.frames + t];
         const auto& objects = decoder_objects();
         if (!cfg.tdt_durations.empty()) {
+            // N-best only lists more of the same search's final hypotheses.
             const auto beam = tdt_beam_search(objects.pred, objects.joint, rows,
                 encoded.frames, encoded.d_model, cfg.tdt_durations,
-                static_cast<int>(cfg.blank_id), beam_size, 1, true, grammar.get());
+                static_cast<int>(cfg.blank_id), beam_size, scored ? beam_size : 1, true,
+                grammar.get());
             if (beam.empty()) return std::nullopt;
             for (const auto& token : beam.front().tokens) ids.push_back(token.id);
+            if (scored) {
+                out.scores.score = beam.front().score;
+                for (size_t i = 1; i < beam.size(); ++i) {
+                    std::vector<int32_t> alternative;
+                    for (const auto& token : beam[i].tokens) alternative.push_back(token.id);
+                    candidates.push_back({detokenize(pieces, alternative), beam[i].score});
+                }
+                const auto free = tdt_beam_search(objects.pred, objects.joint, rows,
+                    encoded.frames, encoded.d_model, cfg.tdt_durations,
+                    static_cast<int>(cfg.blank_id), beam_size, 1, true);
+                if (!free.empty()) out.scores.free_score = free.front().score;
+            }
         } else {
-            const auto& pieces = loader_.tokenizer_pieces();
             const auto control = [&](const char* text) {
                 const auto found = std::find(pieces.begin(), pieces.end(), text);
                 return found == pieces.end() ? -1 : static_cast<int>(found - pieces.begin());
             };
+            const int eou = control("<EOU>"), eob = control("<EOB>");
             RnntGrammarBeam beam(grammar, static_cast<int>(cfg.blank_id), beam_size,
-                static_cast<int>(cfg.max_symbols), control("<EOU>"), control("<EOB>"));
+                static_cast<int>(cfg.max_symbols), eou, eob);
             beam.advance(objects.pred, objects.joint, rows, encoded.frames, encoded.d_model);
             const auto* best = beam.best(true);
             if (!best) return std::nullopt;
             for (const auto& token : best->tokens) ids.push_back(token.id);
+            if (scored) {
+                out.scores.score = best->score;
+                for (const auto& hyp : beam.hypotheses()) {
+                    if (&hyp == best || !beam.accepting(hyp)) continue;
+                    std::vector<int32_t> alternative;
+                    for (const auto& token : hyp.tokens) alternative.push_back(token.id);
+                    candidates.push_back({detokenize(pieces, alternative), hyp.score});
+                }
+                RnntGrammarBeam free(TokenGrammar::unconstrained(static_cast<int>(cfg.blank_id),
+                    {eou, eob}), static_cast<int>(cfg.blank_id), beam_size,
+                    static_cast<int>(cfg.max_symbols), eou, eob);
+                free.advance(objects.pred, objects.joint, rows, encoded.frames, encoded.d_model);
+                if (const auto* free_best = free.best()) out.scores.free_score = free_best->score;
+            }
         }
     }
-    return detokenize(loader_.tokenizer_pieces(), ids);
+    out.text = detokenize(pieces, ids);
+    if (scored)
+        out.scores.alternatives = distinct_alternatives(std::move(candidates), out.text,
+                                                        static_cast<size_t>(beam_size - 1));
+    return out;
+}
+
+std::optional<std::string> Model::transcribe_pcm_grammar(
+        const std::vector<float>& pcm, int sample_rate,
+        std::shared_ptr<const TokenGrammar> grammar, Decoder decoder, int beam_size,
+        const std::string& target_lang) const {
+    auto result = decode_grammar(pcm, sample_rate, std::move(grammar), decoder, beam_size,
+                                 target_lang, false);
+    if (!result) return std::nullopt;
+    return std::move(result->text);
+}
+
+std::optional<GrammarTranscription> Model::transcribe_pcm_grammar_scored(
+        const std::vector<float>& pcm, int sample_rate,
+        std::shared_ptr<const TokenGrammar> grammar, Decoder decoder, int beam_size,
+        const std::string& target_lang) const {
+    return decode_grammar(pcm, sample_rate, std::move(grammar), decoder, beam_size,
+                          target_lang, true);
 }
 
 std::optional<std::string> Model::transcribe_path_grammar(
@@ -406,6 +487,16 @@ std::optional<std::string> Model::transcribe_path_grammar(
         throw std::runtime_error("grammar: cannot load audio file");
     return transcribe_pcm_grammar(audio.samples, 16000, std::move(grammar),
                                   decoder, beam_size, target_lang);
+}
+
+std::optional<GrammarTranscription> Model::transcribe_path_grammar_scored(
+        const std::string& wav_path, std::shared_ptr<const TokenGrammar> grammar,
+        Decoder decoder, int beam_size, const std::string& target_lang) const {
+    Audio audio;
+    if (!load_audio_16k_mono(wav_path, audio))
+        throw std::runtime_error("grammar: cannot load audio file");
+    return transcribe_pcm_grammar_scored(audio.samples, 16000, std::move(grammar),
+                                         decoder, beam_size, target_lang);
 }
 
 void Model::transcribe_16k_ctc_logits(const std::vector<float>& pcm16k,

@@ -19,6 +19,9 @@ struct RnntAcceptedUnit {
     int64_t frame;
 };
 
+// Same tokens, token frames, endpoint and endpoint frame.
+bool same_unit(const RnntAcceptedUnit& a, const RnntAcceptedUnit& b);
+
 // Offline controls preserve the request grammar; streaming controls close and
 // restart a rendering unit immediately, but reset prediction only at chunk end.
 enum class RnntEndpointPolicy { preserve, restart };

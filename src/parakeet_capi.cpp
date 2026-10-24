@@ -553,6 +553,33 @@ int publish_grammar_text(parakeet_ctx* ctx, const std::optional<std::string>& te
     return PARAKEET_GRAMMAR_OK;
 }
 
+// Six decimals in the C locale, whatever the host's numeric locale.
+void append_grammar_number(std::string& out, double value) {
+    if (!std::isfinite(value)) throw std::runtime_error("grammar: nonfinite JSON number");
+    std::ostringstream text;
+    // Formatting failures must reach the boundary before acknowledgement.
+    text.exceptions(std::ios::badbit | std::ios::failbit);
+    text.imbue(std::locale::classic());
+    text << std::fixed << std::setprecision(6) << value;
+    out += text.str();
+}
+
+void append_grammar_scores(std::string& out, const pk::GrammarScores& scores) {
+    out += ",\"score\":";
+    append_grammar_number(out, scores.score);
+    out += ",\"free_score\":";
+    append_grammar_number(out, scores.free_score);
+    out += ",\"frames\":" + std::to_string(scores.frames) + ",\"alternatives\":[";
+    for (size_t i = 0; i < scores.alternatives.size(); ++i) {
+        out += i ? ",{\"text\":" : "{\"text\":";
+        pk::append_json_string(out, scores.alternatives[i].text);
+        out += ",\"score\":";
+        append_grammar_number(out, scores.alternatives[i].score);
+        out += '}';
+    }
+    out += ']';
+}
+
 std::string grammar_stream_json(const pk::GrammarStreamingSession& session) {
     std::string out = "{\"partial\":";
     pk::append_json_string(out, session.partial());
@@ -560,12 +587,7 @@ std::string grammar_stream_json(const pk::GrammarStreamingSession& session) {
     const auto& units = session.units();
     auto position = [&](const pk::GrammarStreamUnit& unit) {
         out += ",\"frame\":" + std::to_string(unit.encoder_frame) + ",\"t\":";
-        std::ostringstream time;
-        // Formatting failures must reach the boundary before acknowledgement.
-        time.exceptions(std::ios::badbit | std::ios::failbit);
-        time.imbue(std::locale::classic());
-        time << std::fixed << std::setprecision(6) << unit.time_sec;
-        out += time.str();
+        append_grammar_number(out, unit.time_sec);
     };
     for (size_t i = 0; i < units.size(); ++i) {
         if (i) out += ',';
@@ -574,6 +596,7 @@ std::string grammar_stream_json(const pk::GrammarStreamingSession& session) {
         pk::append_json_string(out, unit.text);
         out += ",\"endpoint_id\":" + std::to_string(unit.endpoint_id);
         position(unit);
+        append_grammar_scores(out, unit.scores);
         out += '}';
     }
     out += "],\"events\":[";
@@ -588,6 +611,24 @@ std::string grammar_stream_json(const pk::GrammarStreamingSession& session) {
         out += '}';
     }
     return out + "]}";
+}
+
+int publish_grammar_json(parakeet_ctx* ctx,
+                         const std::optional<pk::GrammarTranscription>& result,
+                         char** out_json) {
+    if (!result) {
+        ctx->last_error.clear();
+        return PARAKEET_GRAMMAR_NO_MATCH;
+    }
+    std::string json = "{\"text\":";
+    pk::append_json_string(json, result->text);
+    append_grammar_scores(json, result->scores);
+    json += '}';
+    ctx->last_error.clear();
+    char* buffer = dup_to_c(json);
+    if (!buffer) throw std::bad_alloc();
+    *out_json = buffer;
+    return PARAKEET_GRAMMAR_OK;
 }
 
 int grammar_stream_call(parakeet_grammar_stream* stream, const float* samples,
@@ -677,6 +718,49 @@ extern "C" int parakeet_capi_transcribe_path_grammar(
         const auto result = ctx->model->transcribe_path_grammar(wav_path, grammar->compiled,
             grammar_decoder(decoder), beam_size, target_lang ? target_lang : "");
         return publish_grammar_text(ctx, result, out_text);
+    } catch (const std::exception& e) {
+        record_grammar_error(ctx, e.what());
+    } catch (...) {
+        record_grammar_error(ctx, "grammar: unknown error");
+    }
+    return PARAKEET_GRAMMAR_ERROR;
+}
+
+extern "C" int parakeet_capi_transcribe_pcm_grammar_json(
+    parakeet_ctx* ctx, const parakeet_grammar* grammar,
+    const float* samples, int n_samples, int sample_rate,
+    int decoder, int beam_size, const char* target_lang, char** out_json) {
+    if (out_json) *out_json = nullptr;
+    if (!ctx) return PARAKEET_GRAMMAR_ERROR;
+    try {
+        if (!out_json) throw std::invalid_argument("grammar: NULL output pointer");
+        require_bound_grammar(ctx, grammar);
+        if (n_samples < 0 || (!samples && n_samples))
+            throw std::invalid_argument("grammar: invalid PCM buffer");
+        std::vector<float> pcm;
+        if (n_samples) pcm.assign(samples, samples + n_samples);
+        const auto result = ctx->model->transcribe_pcm_grammar_scored(pcm, sample_rate,
+            grammar->compiled, grammar_decoder(decoder), beam_size, target_lang ? target_lang : "");
+        return publish_grammar_json(ctx, result, out_json);
+    } catch (const std::exception& e) {
+        record_grammar_error(ctx, e.what());
+    } catch (...) {
+        record_grammar_error(ctx, "grammar: unknown error");
+    }
+    return PARAKEET_GRAMMAR_ERROR;
+}
+
+extern "C" int parakeet_capi_transcribe_path_grammar_json(
+    parakeet_ctx* ctx, const parakeet_grammar* grammar, const char* wav_path,
+    int decoder, int beam_size, const char* target_lang, char** out_json) {
+    if (out_json) *out_json = nullptr;
+    if (!ctx) return PARAKEET_GRAMMAR_ERROR;
+    try {
+        if (!out_json || !wav_path) throw std::invalid_argument("grammar: NULL path or output pointer");
+        require_bound_grammar(ctx, grammar);
+        const auto result = ctx->model->transcribe_path_grammar_scored(wav_path, grammar->compiled,
+            grammar_decoder(decoder), beam_size, target_lang ? target_lang : "");
+        return publish_grammar_json(ctx, result, out_json);
     } catch (const std::exception& e) {
         record_grammar_error(ctx, e.what());
     } catch (...) {

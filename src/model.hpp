@@ -1,5 +1,6 @@
 #pragma once
 #include "parakeet.h"          // pk::Decoder
+#include "grammar.hpp"         // pk::GrammarScores
 #include "joint.hpp"
 #include "model_loader.hpp"
 #include "prediction.hpp"
@@ -20,6 +21,12 @@ namespace pk {
 class BackendPool;
 class PoolLease;
 class TokenGrammar;
+
+// A grammar-accepted transcript with its scores over the whole request.
+struct GrammarTranscription {
+    std::string text;
+    GrammarScores scores;
+};
 
 // One text hypothesis returned by the opt-in offline TDT N-best path.
 struct NBestTranscription {
@@ -93,6 +100,19 @@ public:
         Decoder decoder = Decoder::kDefault, int beam_size = 4,
         const std::string& target_lang = "") const;
     std::optional<std::string> transcribe_path_grammar(
+        const std::string& wav_path, std::shared_ptr<const TokenGrammar> grammar,
+        Decoder decoder = Decoder::kDefault, int beam_size = 4,
+        const std::string& target_lang = "") const;
+    // Same search and text, plus scores: free_score runs the same decoder
+    // without the grammar over the same encoder output (CTC: best alignment,
+    // TDT: beam search, RNNT: the same bounded beam). Alternatives are at most
+    // beam_size - 1 distinct accepted texts from the paths the search retained.
+    std::optional<GrammarTranscription> transcribe_pcm_grammar_scored(
+        const std::vector<float>& pcm, int sample_rate,
+        std::shared_ptr<const TokenGrammar> grammar,
+        Decoder decoder = Decoder::kDefault, int beam_size = 4,
+        const std::string& target_lang = "") const;
+    std::optional<GrammarTranscription> transcribe_path_grammar_scored(
         const std::string& wav_path, std::shared_ptr<const TokenGrammar> grammar,
         Decoder decoder = Decoder::kDefault, int beam_size = 4,
         const std::string& target_lang = "") const;
@@ -256,6 +276,12 @@ private:
     std::vector<Transcription> transcribe_16k_grouped(
         const std::vector<const std::vector<float>*>& pcms16k, Decoder decoder,
         const std::string& target_lang, bool with_timestamps) const;
+
+    // Shared by the grammar entry points; `scored` adds the scores.
+    std::optional<GrammarTranscription> decode_grammar(
+        const std::vector<float>& pcm, int sample_rate,
+        std::shared_ptr<const TokenGrammar> grammar, Decoder decoder, int beam_size,
+        const std::string& target_lang, bool scored) const;
 
     std::vector<NBestTranscription> transcribe_16k_nbest(
         const std::vector<float>& pcm16k, int beam_size, int nbest,

@@ -23,13 +23,20 @@ def parse_documents(output):
         for item in document["units"] + document["events"]:
             assert isinstance(item["frame"], int)
             assert type(item["t"]) is float
+        for unit in document["units"]:
+            assert type(unit["score"]) is float and type(unit["free_score"]) is float
+            assert isinstance(unit["frames"], int)
+            for alternative in unit["alternatives"]:
+                assert isinstance(alternative["text"], str) and type(alternative["score"]) is float
         documents[label].append(document)
     return documents
 
 
 def check_results(documents):
     expected = "well i don't wish to see it any more observed phoebe turning away her eyes it is certainly very like the old portrait"
-    units = [unit for doc in documents["utterances"] for unit in doc["units"]]
+    keys = ("text", "endpoint_id", "frame", "t")  # grammar scores are checked above
+    units = [{key: unit[key] for key in keys}
+             for doc in documents["utterances"] for unit in doc["units"]]
     events = [event for doc in documents["utterances"] for event in doc["events"]]
     assert units == [
         {"text": expected, "endpoint_id": 1024, "frame": 98, "t": 7.84},

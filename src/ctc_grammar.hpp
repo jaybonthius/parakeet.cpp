@@ -17,12 +17,20 @@ public:
                int blank_id);
     CtcGrammar(std::shared_ptr<const TokenGrammar> grammar, int blank_id);
 
+    struct Path {
+        std::vector<int32_t> tokens;
+        double score = 0;
+    };
     struct Result {
         bool matched = false;
         std::vector<int32_t> tokens;
         double score = 0;
+        // With `alternatives`: the best path into every other accepting end
+        // state, best first. Different paths can share a text.
+        std::vector<Path> alternatives;
     };
-    Result decode(const std::vector<float>& log_probs, int frames, int classes) const;
+    Result decode(const std::vector<float>& log_probs, int frames, int classes,
+                  bool alternatives = false) const;
 
 private:
     struct CtcState {

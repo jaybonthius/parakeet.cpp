@@ -157,6 +157,56 @@ before further feed/finalize, never replay PCM on an errored stream. Reset clear
 all buffers, caches, search, output queues and time to a fresh origin. Output
 queues are acknowledged only after successful JSON allocation.
 
+### Grammar scores
+
+A grammar turns any audio into some accepted phrase, so the caller needs a way
+to tell a real match from a forced one. Grammar results carry four extra fields:
+
+- `score`: log probability of the accepted path.
+- `free_score`: log probability of the best path the same decoder finds over
+  the same encoder output without the grammar. CTC takes each frame's best
+  label (the exact best alignment), TDT runs its ordinary beam search, and RNNT
+  runs the same bounded beam with every token allowed. The encoder runs once;
+  only the decoder search is repeated.
+- `frames`: number of encoder frames both scores cover.
+- `alternatives`: up to `beam_size - 1` other distinct accepted texts, best
+  first, each with the `score` of its path over the same frames. They come from
+  the paths the search already kept (for CTC, the best path into each other
+  accepting end state); nothing extra is searched. A plausible phrase can be
+  missing because the beam dropped it.
+
+All scores are raw sums of natural-log probabilities (not divided by length),
+never above zero, and **not calibrated confidence**. Compare `score` with
+`free_score` of the same result: equal or close means the grammar barely changed
+what the model would have said; far below means the audio says something else.
+`(score - free_score) / frames` puts results of different lengths on one scale.
+Both searches are bounded, so `score` can be slightly above `free_score`. TDT
+picks its winner by length-normalized score, like the plain call, so a TDT
+alternative can have a higher raw score than the winner.
+
+Offline, `parakeet_capi_transcribe_pcm_grammar_json` and
+`parakeet_capi_transcribe_path_grammar_json` take the same arguments and run the
+same search as the plain calls, and return the scores for the whole request:
+
+```c
+char *json = NULL;
+int status = parakeet_capi_transcribe_path_grammar_json(
+    ctx, g, "command.wav", 0, 8, NULL, &json);
+/* OK: {"text":"open kitchen","score":-3.1,"free_score":-2.9,"frames":31,
+        "alternatives":[{"text":"close kitchen","score":-14.0}]} */
+parakeet_capi_free_string(json); /* NO_MATCH/ERROR leave json NULL */
+```
+
+In a grammar stream every unit carries the same fields. A unit's span runs
+from the previous published unit (or begin/reset) to the end of the native
+chunk that published it, so audio after the endpoint up to the chunk end is
+included. Units published by the same chunk share one span and the same
+`score`, `free_score` and `frames`. Measured on `tests/fixtures/speech.wav`
+with the realtime EOU model: the true sentence gives `score == free_score`;
+a phrase covering only the first words, or a forced command on thunder, gives
+about -0.5 to -0.75 per frame. For unrelated audio the RNNT beam often keeps no
+accepting path at all, which shows up as no unit or `NO_MATCH`.
+
 Contexts outlive all handles/streams/calls. Handles are context-bound and
 shareable across concurrent requests/streams; one caller at a time per stream.
 Freeing a handle after begin is safe. Diagnostics are best-effort even on

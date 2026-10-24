@@ -499,12 +499,55 @@ int parakeet_capi_transcribe_path_grammar(
     parakeet_ctx* ctx, const parakeet_grammar* grammar, const char* wav_path,
     int decoder, int beam_size, const char* target_lang, char** out_text);
 
+// Grammar scores. The grammar always produces some accepted text, so these
+// numbers let a caller judge how much the grammar had to force it:
+//   score       log probability of the accepted path.
+//   free_score  log probability of the best path the same decoder finds over
+//               the same encoder output WITHOUT the grammar (CTC: best
+//               alignment; TDT: the ordinary beam search, beam_size wide;
+//               RNNT: the same bounded beam with every token allowed). The
+//               encoder runs once.
+//   frames      encoder frames both scores cover.
+//   alternatives  up to beam_size - 1 other distinct accepted texts, best
+//               first, each with its path's score over the same frames. They
+//               come from the paths the search already kept (CTC: the best
+//               path into each other accepting end state); none are searched
+//               for. A text can be missing because the beam dropped it.
+// All scores are raw sums of natural-log probabilities, not length-normalized,
+// <= 0, and NOT calibrated confidence. score is close to free_score when the
+// grammar barely changed the result and far below it when the audio says
+// something else; (score - free_score) / frames is a per-frame difference that
+// compares across lengths. score can exceed free_score, as both searches are
+// bounded approximations. TDT picks its winner by length-normalized score, as
+// the plain call does, so a TDT alternative can have a higher raw score.
+//
+// Offline: the same search and text as parakeet_capi_transcribe_*_grammar,
+// over the whole request, as malloc'd JSON (free_string):
+// {"text":"...","score":-12.3,"free_score":-11.9,"frames":93,
+//  "alternatives":[{"text":"...","score":-30.1}]}
+// Status, output and error contracts match transcribe_*_grammar: OK owns the
+// JSON; NO_MATCH/ERROR leave *out_json NULL.
+int parakeet_capi_transcribe_pcm_grammar_json(
+    parakeet_ctx* ctx, const parakeet_grammar* grammar,
+    const float* samples, int n_samples, int sample_rate,
+    int decoder, int beam_size, const char* target_lang, char** out_json);
+int parakeet_capi_transcribe_path_grammar_json(
+    parakeet_ctx* ctx, const parakeet_grammar* grammar, const char* wav_path,
+    int decoder, int beam_size, const char* target_lang, char** out_json);
+
 // Real incremental 16 kHz mono f32 PCM, not buffered offline transcription.
 // Begin returns NULL on unsupported model/configuration, bad beam/language or
 // mismatched context. Partial text is revisable and NEVER append-only. Each JSON
 // document contains the current partial plus ONLY newly committed units/events:
-// {"partial":"...","units":[{"text":"...","endpoint_id":1024,"frame":98,"t":7.84}],
+// {"partial":"...","units":[{"text":"...","endpoint_id":1024,"frame":98,"t":7.84,
+//   "score":-9.2,"free_score":-8.7,"frames":104,"alternatives":[]}],
 //  "events":[{"type":"eou","id":1024,"frame":98,"t":7.84}]}
+// Each unit carries the grammar scores described above, over the frames from
+// the previous published unit (or begin/reset) to the end of the native chunk
+// that published it, so trailing audio after the endpoint is included. Units
+// published by the same chunk share one span and the same three numbers.
+// free_score comes from an unconstrained RNNT beam of the same width run over
+// the same encoder frames.
 // EOU and EOB both require grammar acceptance and restart the grammar per unit.
 // EOB is a backchannel, not end-of-turn. Units are immutable native-chunk-final
 // beam commitments; incompatible histories are pruned, compatible suffixes kept.

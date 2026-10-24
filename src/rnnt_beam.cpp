@@ -20,15 +20,6 @@ size_t history_size(const RnntBeamHypothesis& hyp) {
     return count;
 }
 
-bool same_unit(const RnntAcceptedUnit& a, const RnntAcceptedUnit& b) {
-    if (a.endpoint_id != b.endpoint_id || a.frame != b.frame ||
-        a.tokens.size() != b.tokens.size()) return false;
-    for (size_t i = 0; i < a.tokens.size(); ++i)
-        if (a.tokens[i].id != b.tokens[i].id || a.tokens[i].frame != b.tokens[i].frame)
-            return false;
-    return true;
-}
-
 void prune(std::vector<RnntBeamHypothesis>& paths, int width) {
     // Stable order gives deterministic ties without merging predictor histories.
     std::stable_sort(paths.begin(), paths.end(), [](const auto& a, const auto& b) {
@@ -53,6 +44,15 @@ std::vector<double> log_probs(const std::vector<float>& logits, int blank) {
 }
 
 } // namespace
+
+bool same_unit(const RnntAcceptedUnit& a, const RnntAcceptedUnit& b) {
+    if (a.endpoint_id != b.endpoint_id || a.frame != b.frame ||
+        a.tokens.size() != b.tokens.size()) return false;
+    for (size_t i = 0; i < a.tokens.size(); ++i)
+        if (a.tokens[i].id != b.tokens[i].id || a.tokens[i].frame != b.tokens[i].frame)
+            return false;
+    return true;
+}
 
 RnntGrammarBeam::RnntGrammarBeam(std::shared_ptr<const TokenGrammar> grammar,
                                  int blank_id, int beam_size, int max_symbols,
