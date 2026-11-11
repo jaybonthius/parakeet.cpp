@@ -2198,12 +2198,12 @@ extern "C" parakeet_sound_stream* parakeet_capi_sound_stream_begin(parakeet_ctx*
         const pk::SoundOpts so = to_sound_opts(o);
         const std::string err = pk::validate_sound_opts(so, tagger->tagger->n_classes());
         if (!err.empty()) { tagger->last_error = "invalid sound options: " + err; return nullptr; }
-        auto* s = new parakeet_sound_stream();
+        auto s = std::make_unique<parakeet_sound_stream>();
         s->ctx = tagger;
         s->ss = std::make_unique<pk::SoundStream>(tagger->tagger->scorer(),
                                                   tagger->tagger->n_classes(), so);
         tagger->last_error.clear();
-        return s;
+        return s.release();
     } catch (const std::exception& e) {
         tagger->last_error = e.what();
     } catch (...) {
