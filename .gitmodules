@@ -6,4 +6,4 @@
 	url = https://github.com/localai-org/ced.cpp
 [submodule "third_party/voice-detect.cpp"]
 	path = third_party/voice-detect.cpp
-	url = https://github.com/localai-org/voice-detect.cpp
+	url = https://github.com/jaybonthius/voice-detect.cpp
